@@ -24,6 +24,19 @@ Work done 23–24 November 2026 on the GPU host (`gpu-host`), by one coordinator
 agents on a serialized GPU queue. The same method ports to other cards and models; see
 `COMMERCIAL.md` if you want it applied to yours.
 
+## Quick start
+
+Have an Ubuntu machine with a P104-100 (8 GB exposed) and the NVIDIA driver installed? Then:
+
+```
+git clone https://github.com/mambiux/p104-coding-agent-inference
+cd p104-coding-agent-inference
+bash install.sh
+```
+
+It installs the toolchain, builds the patched fork for this card, downloads the model, caps the
+power, and starts the server with the stock web UI. Details, options and troubleshooting: `GUIDE.md`.
+
 ## Results (same card, same model file)
 
 | Measure | Day 1, stock fork | Served build (`best8`) | Change |
@@ -214,6 +227,7 @@ patches/   best8-cumulative-vs-prism-d12ca13bb.patch  (everything that is servin
 lanes/     per-lane patches and notes (fa, prefill, arch2, arch3, rs, fusion, mtp, mv, best, ...)
 scripts/   serve/ (launchers), system/ (units, power cap, memory offset, cut-over), queue/ (gpuq),
            tune/ (verification battery, sweeps, ladders)
+GUIDE.md   what you need and what install.sh does; install.sh sets a fresh Ubuntu box up end to end
 harness/   headless-browser tests for generated pages and games, fix loop, grader
 ```
 
