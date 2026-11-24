@@ -12,6 +12,9 @@ on op tests and logit divergence against the reference before it counted.
 
 Who this is for:
 
+* the student or tinkerer on a budget who wants a real AI or coding agent at home: a used P104-100
+  costs about €30, draws 128 W here, and runs a 27B model at 42 tokens per second on code; everything
+  needed to do that is in this repository, free for noncommercial use;
 * teams sitting on older or surplus GPUs who want a verified number for what they can really do;
 * builders of coding agents who need local inference with long context at low cost and low power;
 * anyone working on Pascal, ternary formats, speculative decoding, or llama.cpp CUDA kernels, who
