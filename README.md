@@ -195,3 +195,11 @@ harness/   headless-browser tests for generated pages and games, fix loop, grade
 
 Model files are not included. The base fork and the model are public; the machines in the scripts
 are ours (`quasar` = the card's host; the tailnet addresses were replaced with placeholders).
+
+## Credits
+
+Built on the [PrismML](https://github.com/PrismML-Eng/llama.cpp) fork of llama.cpp and its ternary
+formats, on the Bonsai 2 27B model from [PrismML](https://huggingface.co/prism-ml) (the served file
+is a community condensed/edited variant of it, see the model lane notes), on
+[llama.cpp](https://github.com/ggml-org/llama.cpp) itself, and on NVIDIA's GP104, which turned out
+to hold more magic per chip than even they knew.
