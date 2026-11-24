@@ -1,14 +1,25 @@
 # P104-100 coding-agent inference: findings, recipe, and what we did
 
-Running a 27B ternary model (Bonsai 2 27B, PTQ1_0) as a coding-agent inference engine on a single
-**NVIDIA P104-100** (GP104, compute capability 6.1, 8 GB GDDR5X, PCIe Gen1 x2 on this host, passive
-cooling, ~€30 mining card), with long context on the card, low power, and output statistically
-unchanged from the reference build.
+**A 27B model, 2.6× faster, on a €30 graphics card from 2016, with its output provably unchanged.**
 
-Work done 23–24 November 2026 on `gpu-host` (the dev box), by one coordinator and eleven specialist
-agents on a serialized GPU queue. Every change was proven on op tests and logit divergence against
-the reference before it counted. This repository holds the results, the exact recipe, every patch,
-the scripts, and the negative results so nobody repeats them.
+![Before and after: prefill 92.6 → 181 tok/s, decode 17.8 → 29.2, drafted decode 16 → 42.2, decode at 49k context 8.8 → 23.9](docs/before-after.png)
+
+This is the complete record of a two-day program that turned a single **NVIDIA P104-100** (GP104,
+compute capability 6.1, 8 GB GDDR5X, PCIe Gen1 x2 on this host, passively cooled mining card) into a
+coding-agent inference engine for **Bonsai 2 27B** (PTQ1_0 ternary): the kernels, the serving recipe,
+the verification method, every measurement, and every idea that did not work. Each change was proven
+on op tests and logit divergence against the reference before it counted.
+
+Who this is for:
+
+* teams sitting on older or surplus GPUs who want a verified number for what they can really do;
+* builders of coding agents who need local inference with long context at low cost and low power;
+* anyone working on Pascal, ternary formats, speculative decoding, or llama.cpp CUDA kernels, who
+  wants the measurements and the dead ends without repeating two days of work.
+
+Work done 23–24 November 2026 on the GPU host (`gpu-host`), by one coordinator and eleven specialist
+agents on a serialized GPU queue. The same method ports to other cards and models; see
+`COMMERCIAL.md` if you want it applied to yours.
 
 ## Results (same card, same model file)
 
@@ -119,6 +130,16 @@ taught us that), with name-based timeouts (20 min default, 50 min for `*merge-ve
 interleaved `llama-bench` at 0 / 16k / 32k depth, KL divergence of logits against the reference on
 code tokens, two serving turns (short prompt, 30k-token edit) with draft acceptance, and a temp-0
 text compare. Nothing shipped without it.
+
+## Reproduce in an hour
+
+1. Clone the PrismML fork at `d12ca13bb`, apply `patches/best8-cumulative-vs-prism-d12ca13bb.patch`.
+2. Build with the flags above (`-DCMAKE_CUDA_ARCHITECTURES=61`, the listed `GGML_CUDA_FA_QUANTS`).
+3. Get the Bonsai 2 27B PTQ1_0 file with the native MTP head; port the thinking-close edit if you want
+   it (model lane notes).
+4. Run `scripts/tune/merge-verify-cand.sh <bin> <label>` against the reference build: it prints the
+   same op tests, benches at depth, KL divergence and serving turns reported here. If your numbers
+   match the tables, serve with `scripts/serve/bonsai-serve-best2.sh`.
 
 ## What was built
 

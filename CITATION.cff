@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+title: "P104-100 coding-agent inference: a 27B ternary model on an 8 GB Pascal card"
+message: "If you use this work, please cite it."
+type: software
+authors:
+  - name: "mambiux"
+    website: "https://github.com/mambiux"
+date-released: 2026-11-24
+url: "https://github.com/mambiux/p104-coding-agent-inference"
+license: PolyForm-Noncommercial-1.0.0
+keywords:
+  - llama.cpp
+  - CUDA
+  - Pascal
+  - ternary quantization
+  - speculative decoding
+  - GPU optimization
+  - coding agents
+abstract: "Kernels, serving recipe, verification method and measured results for running Bonsai 2 27B (PTQ1_0 ternary) as a coding-agent inference engine on a single NVIDIA P104-100: 2x prefill, 2.6x drafted decode, 2.7x decode at 49k context, 29% less power, output statistically unchanged. Includes the negative results."
