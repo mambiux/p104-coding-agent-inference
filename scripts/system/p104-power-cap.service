@@ -1,0 +1,8 @@
+[Unit]
+Description=Cap the P104-100 power limit at 128 W
+After=nvidia-persistenced.service multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/p104-power-cap
+[Install]
+WantedBy=multi-user.target

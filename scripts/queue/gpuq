@@ -1,0 +1,8 @@
+#!/bin/bash
+# gpuq <name> <command...>  — queue a command for exclusive execution on the P104 (FIFO, one at a time). Prints the job log when done.
+# Inside the job: CUDA_VISIBLE_DEVICES is already pinned to the P104. Anything that touches the P104 outside gpuq is killed by the watchdog.
+[ $# -ge 2 ] || { echo "usage: gpuq <name> <command...>"; exit 2; }
+Q=/home/mbx/longshot/tune/queue; n=$(date +%s%N)-$1; printf '%s\n' "${@:2}" > $Q/pending/$n.job.tmp && mv $Q/pending/$n.job.tmp $Q/pending/$n.job
+echo "[gpuq] queued $n (position $(ls $Q/pending | wc -l) in queue)" >&2
+while [ ! -f $Q/done/$n.log ] || ! grep -q '^GPUQ_EXIT=' $Q/done/$n.log; do sleep 3; done
+cat $Q/done/$n.log; exit $(grep -oE '^GPUQ_EXIT=[0-9]+' $Q/done/$n.log | cut -d= -f2)

@@ -1,0 +1,13 @@
+#!/bin/bash
+# gpuq runner: FIFO over queue/pending, one job at a time under gpu.lock. Each job runs in its own session; the whole session is killed when the job ends, so no sampler/server orphans can hold the lock or the card.
+Q=/home/mbx/longshot/tune/queue; export CUDA_VISIBLE_DEVICES=GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81
+while true; do
+  j=$(ls -1 $Q/pending/*.job 2>/dev/null | head -1); [ -z "$j" ] && { sleep 2; continue; }
+  n=$(basename $j .job); mv $j $Q/running/$n.job || continue
+  echo "[$(date +%T)] START $n" >> $Q/runner.log; rm -f $Q/current.sid
+  ( cd /home/mbx; flock $Q/../gpu.lock setsid bash -c 'echo $$ > '"$Q"'/current.sid; exec sudo -u mbx -E bash "$1"' _ $Q/running/$n.job > $Q/done/$n.log 2>&1; echo "GPUQ_EXIT=$?" >> $Q/done/$n.log ) &
+  echo $! > $Q/current.pid; wait $!
+  sid=$(cat $Q/current.sid 2>/dev/null); [ -n "$sid" ] && pkill -9 -s $sid 2>/dev/null
+  rm -f $Q/current.pid $Q/current.sid $Q/running/$n.job
+  echo "[$(date +%T)] END   $n" >> $Q/runner.log; sleep 2
+done

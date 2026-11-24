@@ -1,0 +1,210 @@
+--- prism-pascal-best2/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-24 13:43:23.268682808 +0100
++++ prism-pascal-arch3/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-24 14:50:23.977466640 +0100
+@@ -226,6 +226,185 @@
+     }
+ }
+ 
++
++// Direct-load form of the one-column kernel (no shared-memory staging): same octet geometry, K-block order, decode
++// and reductions as mul_mat_vec_ptq1_0_p61 (bit-identical results), but every lane loads the 7 words of its own block
++// straight into registers (7 x LDG.32; the 8 lanes of an octet cover 224 contiguous bytes of a row, so DRAM traffic is
++// unchanged and the strided words hit L1) and keeps PF K-steps of loads in flight in a register ring. This removes the
++// LDG -> STS -> syncwarp -> LDS hand-off per step, which serialized the loads with the decode.
++template <int R, int NW, int PF, bool has_gate>
++__launch_bounds__(NW * WARP_SIZE, 1)
++static __global__ void mul_mat_vec_ptq1_0_p61_dir(
++        const void * __restrict__ vx, const void * __restrict__ vgate, const int * __restrict__ y,
++        const float * __restrict__ x_bias, const float * __restrict__ gate_bias, const ggml_glu_op glu_op, const float glu_limit,
++        float * __restrict__ dst, const int nblk, const int nrows, const int stride_row_x) {
++    constexpr int NM = has_gate ? 2 : 1;
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int j    = lane & 7;
++    const int o    = lane >> 3;
++    const int row0 = ((blockIdx.x * NW + warp) * 4 + o) * R;
++
++    const uint32_t * base[NM][R];
++#pragma unroll
++    for (int m = 0; m < NM; ++m) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const uint32_t * mat = (const uint32_t *) (m == 0 ? vx : vgate);
++            base[m][r] = mat + ((size_t) min(row0 + r, nrows - 1) * stride_row_x + j) * 7;
++        }
++    }
++
++    float acc[R];
++    float accg[R];
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        acc[r]  = 0.0f;
++        accg[r] = 0.0f;
++    }
++
++    const int nsteps = nblk / 8;
++    uint32_t ring[PF][NM][R][7];
++#pragma unroll
++    for (int p = 0; p < PF; ++p) {
++#pragma unroll
++        for (int m = 0; m < NM; ++m) {
++#pragma unroll
++            for (int r = 0; r < R; ++r) {
++#pragma unroll
++                for (int i = 0; i < 7; ++i) {
++                    ring[p][m][r][i] = p < nsteps ? __ldg(base[m][r] + p * 56 + i) : 0u;
++                }
++            }
++        }
++    }
++    for (int st = 0; st < nsteps; ++st) {
++        uint32_t w[NM][R][7];
++#pragma unroll
++        for (int m = 0; m < NM; ++m) {
++#pragma unroll
++            for (int r = 0; r < R; ++r) {
++#pragma unroll
++                for (int i = 0; i < 7; ++i) {
++                    w[m][r][i] = ring[0][m][r][i];
++                }
++            }
++        }
++#pragma unroll
++        for (int p = 0; p + 1 < PF; ++p) {
++#pragma unroll
++            for (int m = 0; m < NM; ++m) {
++#pragma unroll
++                for (int r = 0; r < R; ++r) {
++#pragma unroll
++                    for (int i = 0; i < 7; ++i) {
++                        ring[p][m][r][i] = ring[p + 1][m][r][i];
++                    }
++                }
++            }
++        }
++        {
++            const int sn = st + PF;
++#pragma unroll
++            for (int m = 0; m < NM; ++m) {
++#pragma unroll
++                for (int r = 0; r < R; ++r) {
++#pragma unroll
++                    for (int i = 0; i < 7; ++i) {
++                        ring[PF - 1][m][r][i] = sn < nsteps ? __ldg(base[m][r] + sn * 56 + i) : 0u;
++                    }
++                }
++            }
++        }
++        const int   kb = st * 8 + j;
++        const int * yw = y + (kb >> 5) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + (kb & 31);
++        int   u[32];
++        float d8[4];
++        int   is[4];
++#pragma unroll
++        for (int i = 0; i < 32; ++i) {
++            u[i] = __ldg(yw + i * GGML_CUDA_PTQ1_Q8_GROUP_KB);
++        }
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const int   ds_bits = __ldg(yw + (32 + k) * GGML_CUDA_PTQ1_Q8_GROUP_KB);
++            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
++            d8[k] = __low2float(ds);
++            is[k] = (int) __half_as_short(__high2half(ds));
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            int sumi[4] = { 0, 0, 0, 0 };
++            ptq1_p61_block_isum(w[0][r], u, sumi);
++            acc[r] += ptq1_p61_scale_dot(sumi, d8, is, w[0][r][6]);
++            if constexpr (has_gate) {
++                int sg[4] = { 0, 0, 0, 0 };
++                ptq1_p61_block_isum(w[NM - 1][r], u, sg);
++                accg[r] += ptq1_p61_scale_dot(sg, d8, is, w[NM - 1][r][6]);
++            }
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++#pragma unroll
++        for (int m = 1; m < 8; m <<= 1) {
++            acc[r] += __shfl_xor_sync(0xFFFFFFFF, acc[r], m);
++            if constexpr (has_gate) {
++                accg[r] += __shfl_xor_sync(0xFFFFFFFF, accg[r], m);
++            }
++        }
++    }
++    if (j == 0) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const int row = row0 + r;
++            if (row >= nrows) {
++                continue;
++            }
++            float result = acc[r];
++            if (x_bias) {
++                result += x_bias[row];
++            }
++            if constexpr (has_gate) {
++                float gate_value = accg[r];
++                if (gate_bias) {
++                    gate_value += gate_bias[row];
++                }
++                switch (glu_op) {
++                    case GGML_GLU_OP_SWIGLU:       result *= ggml_cuda_op_silu_single(gate_value); break;
++                    case GGML_GLU_OP_GEGLU:        result *= ggml_cuda_op_gelu_single(gate_value); break;
++                    case GGML_GLU_OP_SWIGLU_OAI:   result  = ggml_cuda_op_swiglu_oai_single(gate_value, result); break;
++                    case GGML_GLU_OP_SWIGLU_CLAMP: result  = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit); break;
++                    default:                       result *= gate_value; break;
++                }
++            }
++            dst[row] = result;
++        }
++    }
++}
++
++static int ggml_cuda_ptq1_0_p61_dir_env(const char * name, const int def) {
++    const char * s = getenv(name);
++    return s == nullptr ? def : atoi(s);
++}
++
++template <int R, int NW, int PF>
++static void mul_mat_vec_ptq1_0_p61_dir_launch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int nblk, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
++    const bool has_gate = fusion.gate != nullptr;
++    const float * x_bias    = (const float *) fusion.x_bias;
++    const float * gate_bias = has_gate ? (const float *) fusion.gate_bias : nullptr;
++    const dim3 grid((nrows_x + 4 * R * NW - 1) / (4 * R * NW));
++    if (has_gate) {
++        mul_mat_vec_ptq1_0_p61_dir<R, NW, PF, true><<<grid, NW * WARP_SIZE, 0, stream>>>(
++            vx, fusion.gate, (const int *) vy, x_bias, gate_bias, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
++    } else {
++        mul_mat_vec_ptq1_0_p61_dir<R, NW, PF, false><<<grid, NW * WARP_SIZE, 0, stream>>>(
++            vx, nullptr, (const int *) vy, x_bias, nullptr, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
++    }
++}
++
+ static bool ggml_cuda_ptq1_0_p61_enabled() {
+     static const bool enabled = [] {
+         const char * s = getenv("GGML_CUDA_PTQ1_P61");
+@@ -251,6 +430,21 @@
+     const bool has_gate = fusion.gate != nullptr;
+     const float * x_bias    = (const float *) fusion.x_bias;
+     const float * gate_bias = has_gate ? (const float *) fusion.gate_bias : nullptr;
++    // GGML_CUDA_PTQ1_P61_DIRECT=0: shared-memory staged kernel; otherwise the direct-load kernel with
++    // GGML_CUDA_PTQ1_P61_DIRECT_CFG: 1 = R2 NW4 PF1, 2 = R2 NW4 PF2, 3 = R1 NW4 PF2, 4 = R1 NW8 PF2, 5 = R1 NW4 PF1
++    // opt-in: measured on the P104 (test-backend-ops, interleaved) -4 % at K=17408 and 5120x6144 but +1..10 % elsewhere
++    static const int direct = ggml_cuda_ptq1_0_p61_dir_env("GGML_CUDA_PTQ1_P61_DIRECT", 0);
++    static const int dcfg   = ggml_cuda_ptq1_0_p61_dir_env("GGML_CUDA_PTQ1_P61_DIRECT_CFG", 1);
++    if (direct) {
++        switch (dcfg) {
++            case 1:  mul_mat_vec_ptq1_0_p61_dir_launch<2, 4, 1>(vx, vy, fusion, dst, nblk, nrows_x, stride_row_x, stream); break;
++            case 3:  mul_mat_vec_ptq1_0_p61_dir_launch<1, 4, 2>(vx, vy, fusion, dst, nblk, nrows_x, stride_row_x, stream); break;
++            case 4:  mul_mat_vec_ptq1_0_p61_dir_launch<1, 8, 2>(vx, vy, fusion, dst, nblk, nrows_x, stride_row_x, stream); break;
++            case 5:  mul_mat_vec_ptq1_0_p61_dir_launch<1, 4, 1>(vx, vy, fusion, dst, nblk, nrows_x, stride_row_x, stream); break;
++            default: mul_mat_vec_ptq1_0_p61_dir_launch<2, 4, 2>(vx, vy, fusion, dst, nblk, nrows_x, stride_row_x, stream); break;
++        }
++        return true;
++    }
+     constexpr int R  = PTQ1_P61_R;
+     constexpr int NW = PTQ1_P61_NW;
+     const dim3 grid((nrows_x + 4 * R * NW - 1) / (4 * R * NW));

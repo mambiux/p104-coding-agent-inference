@@ -1,0 +1,11 @@
+#!/bin/bash
+Q=/home/mbx/longshot/tune/queue; L=$Q/health.log
+while true; do
+  cur=$(cat $Q/current.pid 2>/dev/null); run=$(ls $Q/running 2>/dev/null | sed 's/^[0-9]*-//'); pend=$(ls $Q/pending | wc -l)
+  util=$(nvidia-smi -i 0 --query-gpu=utilization.gpu --format=csv,noheader,nounits); mem=$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)
+  age=$(ps -o etimes= -p ${cur:-0} 2>/dev/null | tr -d ' '); holders=$(lsof $Q/../gpu.lock 2>/dev/null | tail -n +2 | wc -l)
+  flag=""; [ -n "$run" ] && [ "${util:-0}" -lt 5 ] && [ "${mem:-0}" -lt 200 ] && [ "${age:-0}" -gt 240 ] && flag="IDLE-WHILE-RUNNING"
+  [ "$holders" -gt 2 ] && flag="$flag LOCK-HOLDERS=$holders"
+  echo "$(date +%T) run=${run:-none} age=${age:-0}s util=${util}% mem=${mem}MiB pending=$pend holders=$holders ${flag}" >> $L
+  sleep 120
+done

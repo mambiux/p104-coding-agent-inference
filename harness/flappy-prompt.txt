@@ -1,0 +1,13 @@
+You are a senior front-end game developer. Build a complete, polished Flappy-Bird-style game as ONE self-contained HTML file (inline CSS and JavaScript, no external assets, libraries, fonts or network requests). Output ONLY the HTML file inside a single ```html code block, nothing else before or after.
+
+Requirements:
+1. Canvas-based rendering with requestAnimationFrame and a fixed-timestep physics update (so speed is identical at 60 Hz and 144 Hz). Fill the viewport, keep a 9:16 playfield centered with letterboxing, crisp on high-DPI screens.
+2. Controls: Space / ArrowUp / mouse click / touch to flap. Pause with P. Restart with R or by clicking after game over.
+3. States: title screen (with instructions and best score), playing, game over (score, best score, "tap to retry"). Best score persists in localStorage, wrapped in try/catch.
+4. Bird: gravity, flap impulse, rotation that follows velocity, simple wing animation drawn with canvas primitives (no images).
+5. Pipes: random gap positions, consistent spacing, scrolling ground, parallax background with clouds or hills, day/night color cycle every 10 points.
+6. Difficulty ramps gently: pipe speed and gap shrink with score, with floors so it stays playable.
+7. Collision: precise against pipes and ground; a brief hit flash and a short screen shake on death.
+8. Score shown large at the top during play; medal (bronze/silver/gold) on the game-over panel at 10/25/50.
+9. Sound: tiny procedural effects with the Web Audio API (flap, score, hit), created lazily on the first user gesture, with an M key mute toggle; the game must work fine if AudioContext is unavailable.
+10. Code quality: no globals leaking except one namespace object; no console errors; works in Chrome, Firefox and Safari; the whole file under 900 lines.

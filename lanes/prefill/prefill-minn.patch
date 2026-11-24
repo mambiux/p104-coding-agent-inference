@@ -1,0 +1,71 @@
+--- a/ggml/src/ggml-cuda/mmq-ptq1-p61.cuh	2026-11-24 06:09:38.417746595 +0100
++++ b/ggml/src/ggml-cuda/mmq-ptq1-p61.cuh	2026-11-24 12:31:12.647486337 +0100
+@@ -234,21 +234,29 @@
+     return enabled;
+ }
+ 
+-// minimum batch for the 128x128 tile kernel (below it the generic MMQ with narrower J tiles is used)
+-static int64_t ggml_cuda_ptq1_p61_mmq_min_cols() {
++// The tile kernel costs the same for every n in one 128-column tile and is ~10 % faster than the generic MMQ per
++// column at full tiles (measured on P104: n=128/256/512 ratio 0.90, n=64 1.67, n=96 1.04, n=192 1.21-1.27).
++// Use it for n >= GGML_CUDA_PTQ1_P61_MMQ_MIN_N (default 128) and only while the column padding of the last tile
++// stays <= 1/9 of n; everything else keeps the generic MMQ path.
++static int64_t ggml_cuda_ptq1_p61_mmq_min_n() {
+     static const int64_t v = [] {
+-        const char * s = getenv("GGML_CUDA_PTQ1_P61_MMQ_MIN_COLS");
+-        return s ? (int64_t) atoll(s) : (int64_t) 64;
++        const char * s = getenv("GGML_CUDA_PTQ1_P61_MMQ_MIN_N");
++        return s ? (int64_t) atoll(s) : (int64_t) 128;
+     }();
+     return v;
+ }
+ 
++static bool ggml_cuda_ptq1_p61_mmq_n_ok(const int64_t n) {
++    const int64_t pad = (n + PTQ1_P61_J - 1)/PTQ1_P61_J*PTQ1_P61_J - n;
++    return n >= ggml_cuda_ptq1_p61_mmq_min_n() && 9*pad <= n;
++}
++
+ static bool ggml_cuda_ptq1_p61_mmq_use(const mmq_args & args, const int cc) {
+     return cc == GGML_CUDA_CC_DP4A && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DP4A &&
+         ggml_cuda_ptq1_p61_mmq_enabled() && args.type_x == GGML_TYPE_PTQ1_0 &&
+         args.ids_dst == nullptr && args.expert_bounds == nullptr && args.fusion.gate == nullptr &&
+         args.nchannels_x == 1 && args.nchannels_y == 1 && args.nsamples_x == 1 && args.nsamples_y == 1 &&
+-        args.ncols_x % QK_PTQ1_0 == 0 && args.ncols_dst >= ggml_cuda_ptq1_p61_mmq_min_cols() &&
++        args.ncols_x % QK_PTQ1_0 == 0 && ggml_cuda_ptq1_p61_mmq_n_ok(args.ncols_dst) &&
+         (args.nrows_x + 63)/64 <= 65535;
+ }
+ 
+--- a/tests/test-backend-ops.cpp	2026-11-24 08:21:03.044822460 +0100
++++ b/tests/test-backend-ops.cpp	2026-11-24 12:32:53.695735150 +0100
+@@ -12652,6 +12652,15 @@
+         }
+     }
+ 
++    // PTQ1_0 prefill GEMM (sm_61 ternary tile kernel): full and partial 128x128 tiles, row tails, long K
++    for (int n : {9, 64, 100, 127, 128, 200, 250, 480, 512}) {
++        for (int m : {128, 1000, 1024}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 256, n, 17408, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 200, n, 640, {2, 1}, {1, 1}));
++    }
++
+     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
+@@ -14204,6 +14213,15 @@
+     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
+     }
++    // PTQ1_0 batched GEMMs at the Bonsai-2 27B projection shapes (m = rows, k = K): sm_61 tile vs generic MMQ crossover
++    for (int n : {5, 8, 16, 32, 48, 64, 96, 128, 192, 256, 512}) {
++        for (auto mk : std::vector<std::pair<int, int>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++    for (int n : {16, 48, 128, 256, 512}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
++    }
+     // batched decode (several sequences per step) through the mat-vec path
+     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
+         for (int n : {2, 3, 4, 8}) {

@@ -1,0 +1,23 @@
+#!/bin/bash
+# kill a gpuq job whose PROCESS has run longer than 20 minutes (measured from process start, not from the job file's mtime)
+Q=/home/mbx/longshot/tune/queue
+while true; do
+  cur=$(cat $Q/current.pid 2>/dev/null)
+  if [ -n "$cur" ] && kill -0 $cur 2>/dev/null; then
+    age=$(ps -o etimes= -p $cur 2>/dev/null | tr -d ' ')
+    if [ -f $Q/grace ] && [ "$(cat $Q/grace)" = "$cur" ]; then age=0; fi
+    lim=1200; jn=$(ls $Q/running/*.job 2>/dev/null | head -1); case "$jn" in *merge-verify*|*-long-*|*rs-restore*) lim=3000;; esac
+    if [ "${age:-0}" -gt $lim ]; then j=$(ls $Q/running/*.job 2>/dev/null | head -1); echo "[$(date +%T)] TIMEOUT $(basename "$j") after ${age}s" >> $Q/timeout.log; for d in $(python3 -c "import os,sys
+root=sys.argv[1];k={}
+for p in os.listdir('/proc'):
+  if p.isdigit():
+    try: pp=open(f'/proc/{p}/stat').read().split(') ')[1].split()[1]
+    except Exception: continue
+    k.setdefault(pp,[]).append(p)
+out=[];st=[root]
+while st:
+  x=st.pop(); out.append(x); st+=k.get(x,[])
+print(' '.join(out[1:]))" $cur); do kill -9 $d 2>/dev/null; done; sleep 3; for p in $(nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader | grep a2c2ef95 | cut -d, -f1); do kill $p 2>/dev/null; done; fi
+  fi
+  sleep 30
+done

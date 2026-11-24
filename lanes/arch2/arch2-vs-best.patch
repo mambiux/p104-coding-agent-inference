@@ -1,0 +1,563 @@
+--- prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-23 22:26:18.008073180 +0100
++++ prism-pascal-arch2/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-24 05:52:08.905587895 +0100
+@@ -264,4 +264,509 @@
+     return true;
+ }
+ 
++
++// ---------------------------------------------------------------------------------------------------------------
++// Multi-column variant (2..4 activation columns per launch, e.g. MTP / speculative verify batches): the same octet
++// geometry, weight staging and H-trick decode as above; every decoded H word is dotted with all NC columns, so the
++// weights are read and decoded once per launch. Activations come in the planar-transposed (PT) layout that the
++// quantizer produces for 2-8 columns (see mmvq-ptq1_0.cuh): plane t holds elements 16t..16t+15 of every K-block as
++// one aligned 16-byte piece, so the 32 q8 words of a K-block are 8 coalesced 16-byte loads per column, plus one for
++// the 4 (d, exact int sum) pairs. More than 4 columns are processed in groups of at most 4 by the host.
++template <int NC>
++static __device__ __forceinline__ void ptq1_p61_block_isum_mc(const uint32_t * w, const int (&u)[NC][32], int (&sumi)[NC][4]) {
++    int sb[NC][4];
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            sb[c][k] = 0;
++        }
++    }
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++        uint32_t v_lo = w[g] & 0x00FF00FFu;
++        uint32_t v_hi = __byte_perm(w[g], 0, 0x4341);
++#pragma unroll
++        for (int s = 1; s <= 5; ++s) {
++            v_lo = ptq1_p61_mul3(v_lo);
++            v_hi = ptq1_p61_mul3(v_hi);
++            const uint32_t H  = __byte_perm(v_lo, v_hi, 0x7351);
++            const int      ea = g < 4 ? (s - 1) * 16 + 4 * g : 80 + (s - 1) * 8 + 4 * (g - 4);
++            const int      eb = g < 4 ? s * 16 + 4 * g : 80 + s * 8 + 4 * (g - 4);
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                if (s == 5) {
++                    sumi[c][ea >> 5] = ptq1_p61_dp4a_us(H, u[c][ea >> 2], sumi[c][ea >> 5]);
++                } else {
++                    sumi[c][ea >> 5] = ggml_cuda_dp4a((int) H, u[c][ea >> 2], sumi[c][ea >> 5]);
++                    sb[c][eb >> 5]   = ggml_cuda_dp4a((int) H, u[c][eb >> 2], sb[c][eb >> 5]);
++                }
++            }
++        }
++    }
++    uint32_t v = (w[6] & 0xFFu) | ((w[6] & 0xFF00u) << 8);
++#pragma unroll
++    for (int t = 0; t < 4; t += 2) {
++        const uint32_t w0 = ptq1_p61_mul3(v);
++        v                 = w0 & 0x00FF00FF;
++        const uint32_t w1 = ptq1_p61_mul3(v);
++        v                 = w1 & 0x00FF00FF;
++        const int q = (int) __byte_perm(w0, w1, 0x7531);
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++            sumi[c][3] = ggml_cuda_dp4a(q, u[c][30 + t / 2], sumi[c][3]);
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            sumi[c][k] -= ptq1_p61_mul3((uint32_t) sb[c][k]);
++        }
++    }
++}
++
++// Streaming form for the PT layout: yc[c] points at plane 0 of this K-block for column c, planes are pstride int4 apart.
++// Bytes 16..23 (elements 80..119, planes 5..7) and qh (plane 7, words 2..3) first, then bytes 0..15 walking planes 0..5,
++// so at most three 16-byte planes per column are live (the all-in-registers form needs 32 words per column and ran
++// at 2 CTAs/SM for NC = 4).
++template <int NC>
++static __device__ __forceinline__ void ptq1_p61_block_isum_pt(const uint32_t * w, const int4 * const (&yc)[NC], const int pstride,
++                                                              int (&sumi)[NC][4]) {
++    int sb[NC][4];
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            sb[c][k] = 0;
++        }
++    }
++    {
++        int4 p5[NC], p6[NC], p7[NC];
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++            p5[c] = __ldg(yc[c] + 5 * pstride);
++            p6[c] = __ldg(yc[c] + 6 * pstride);
++            p7[c] = __ldg(yc[c] + 7 * pstride);
++        }
++        // word (plane, i) of the 8-byte group at trit t: plane 5 + t/2, word 2*(t%2) + (g-4)
++        auto wordat = [&](const int c, const int t, const int gg) -> int {
++            const int pl = 5 + t / 2;
++            const int wi = 2 * (t % 2) + gg;
++            const int4 & q = pl == 5 ? p5[c] : (pl == 6 ? p6[c] : p7[c]);
++            return wi == 0 ? q.x : (wi == 1 ? q.y : (wi == 2 ? q.z : q.w));
++        };
++#pragma unroll
++        for (int gg = 0; gg < 2; ++gg) {
++            uint32_t v_lo = w[4 + gg] & 0x00FF00FFu;
++            uint32_t v_hi = __byte_perm(w[4 + gg], 0, 0x4341);
++#pragma unroll
++            for (int s = 1; s <= 5; ++s) {
++                v_lo = ptq1_p61_mul3(v_lo);
++                v_hi = ptq1_p61_mul3(v_hi);
++                const uint32_t H  = __byte_perm(v_lo, v_hi, 0x7351);
++                const int      ea = 80 + (s - 1) * 8 + 4 * gg;
++                const int      eb = 80 + s * 8 + 4 * gg;
++#pragma unroll
++                for (int c = 0; c < NC; ++c) {
++                    if (s == 5) {
++                        sumi[c][ea >> 5] = ptq1_p61_dp4a_us(H, wordat(c, s - 1, gg), sumi[c][ea >> 5]);
++                    } else {
++                        sumi[c][ea >> 5] = ggml_cuda_dp4a((int) H, wordat(c, s - 1, gg), sumi[c][ea >> 5]);
++                        sb[c][eb >> 5]   = ggml_cuda_dp4a((int) H, wordat(c, s, gg), sb[c][eb >> 5]);
++                    }
++                }
++            }
++        }
++        uint32_t v = (w[6] & 0xFFu) | ((w[6] & 0xFF00u) << 8);
++#pragma unroll
++        for (int t = 0; t < 4; t += 2) {
++            const uint32_t w0 = ptq1_p61_mul3(v);
++            v                 = w0 & 0x00FF00FF;
++            const uint32_t w1 = ptq1_p61_mul3(v);
++            v                 = w1 & 0x00FF00FF;
++            const int q = (int) __byte_perm(w0, w1, 0x7531);
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                sumi[c][3] = ggml_cuda_dp4a(q, t == 0 ? p7[c].z : p7[c].w, sumi[c][3]);
++            }
++        }
++    }
++    uint32_t v_lo[4], v_hi[4];
++#pragma unroll
++    for (int g = 0; g < 4; ++g) {
++        v_lo[g] = w[g] & 0x00FF00FFu;
++        v_hi[g] = __byte_perm(w[g], 0, 0x4341);
++    }
++    int4 pprev[NC];
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++        pprev[c] = __ldg(yc[c]);
++    }
++#pragma unroll
++    for (int s = 1; s <= 5; ++s) {
++        int4 pcur[NC];
++        if (s <= 4) {
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                pcur[c] = __ldg(yc[c] + s * pstride);
++            }
++        }
++#pragma unroll
++        for (int g = 0; g < 4; ++g) {
++            v_lo[g] = ptq1_p61_mul3(v_lo[g]);
++            v_hi[g] = ptq1_p61_mul3(v_hi[g]);
++            const uint32_t H  = __byte_perm(v_lo[g], v_hi[g], 0x7351);
++            const int      ka = ((s - 1) * 16 + 4 * g) >> 5;
++            const int      kb = (s * 16 + 4 * g) >> 5;
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                const int xa = g == 0 ? pprev[c].x : (g == 1 ? pprev[c].y : (g == 2 ? pprev[c].z : pprev[c].w));
++                if (s == 5) {
++                    sumi[c][ka] = ptq1_p61_dp4a_us(H, xa, sumi[c][ka]);
++                } else {
++                    const int xb = g == 0 ? pcur[c].x : (g == 1 ? pcur[c].y : (g == 2 ? pcur[c].z : pcur[c].w));
++                    sumi[c][ka] = ggml_cuda_dp4a((int) H, xa, sumi[c][ka]);
++                    sb[c][kb]   = ggml_cuda_dp4a((int) H, xb, sb[c][kb]);
++                }
++            }
++        }
++        if (s <= 4) {
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                pprev[c] = pcur[c];
++            }
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            sumi[c][k] -= ptq1_p61_mul3((uint32_t) sb[c][k]);
++        }
++    }
++}
++
++// Classic digit walk (v <- 3v mod 256 per 16-bit lane, digit = high byte), one dp4a per column per 4 trits: with
++// several columns the per-column cost is what matters (H-trick: 2 dp4a per column, classic: 1), the shared walk costs
++// two more full-rate LOPs per 4 trits.
++template <int NC>
++static __device__ __forceinline__ void ptq1_p61_block_isum_classic(const uint32_t * w, const int (&u)[NC][32], int (&sumi)[NC][4]) {
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++        uint32_t v_lo = w[g] & 0x00FF00FFu;
++        uint32_t v_hi = __byte_perm(w[g], 0, 0x4341);
++#pragma unroll
++        for (int t = 0; t < 5; ++t) {
++            const uint32_t w_lo = ptq1_p61_mul3(v_lo);
++            const uint32_t w_hi = ptq1_p61_mul3(v_hi);
++            v_lo = w_lo & 0x00FF00FFu;
++            v_hi = w_hi & 0x00FF00FFu;
++            const int q = (int) __byte_perm(w_lo, w_hi, 0x7351);
++            const int e = g < 4 ? t * 16 + 4 * g : 80 + t * 8 + 4 * (g - 4);
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                sumi[c][e >> 5] = ggml_cuda_dp4a(q, u[c][e >> 2], sumi[c][e >> 5]);
++            }
++        }
++    }
++    uint32_t v = (w[6] & 0xFFu) | ((w[6] & 0xFF00u) << 8);
++#pragma unroll
++    for (int t = 0; t < 4; t += 2) {
++        const uint32_t w0 = ptq1_p61_mul3(v);
++        v                 = w0 & 0x00FF00FF;
++        const uint32_t w1 = ptq1_p61_mul3(v);
++        v                 = w1 & 0x00FF00FF;
++        const int q = (int) __byte_perm(w0, w1, 0x7531);
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++            sumi[c][3] = ggml_cuda_dp4a(q, u[c][30 + t / 2], sumi[c][3]);
++        }
++    }
++}
++
++template <int R, int NW, int NC, bool has_gate, int MODE>
++__launch_bounds__(NW * WARP_SIZE, 1)
++static __global__ void mul_mat_vec_ptq1_0_p61_mc(
++        const void * __restrict__ vx, const void * __restrict__ vgate, const char * __restrict__ y,
++        const float * __restrict__ x_bias, const float * __restrict__ gate_bias, const ggml_glu_op glu_op, const float glu_limit,
++        float * __restrict__ dst, const int nblk, const int nrows, const int stride_row_x,
++        const int nblk_pt, const int stride_col_y_bytes, const int stride_col_dst) {
++    constexpr int NM  = has_gate ? 2 : 1;
++    constexpr int NCH = NM * 4 * R * 14;
++    constexpr int NL  = (NCH + 31) / 32;
++    __shared__ int4 sm[NW][NL * 32];
++
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int j    = lane & 7;
++    const int o    = lane >> 3;
++    const int rowW = (blockIdx.x * NW + warp) * 4 * R;
++
++    const int4 * src[NL];
++#pragma unroll
++    for (int l = 0; l < NL; ++l) {
++        const int c  = l * 32 + lane;
++        const int cc = c < NCH ? c : 0;
++        const int m  = cc / (4 * R * 14);
++        const int rr = (cc % (4 * R * 14)) / 14;
++        const int pc = cc % 14;
++        const int row = min(rowW + rr, nrows - 1);
++        const char * base = (const char *) (m == 0 ? vx : vgate);
++        src[l] = (const int4 *) (base + (size_t) row * stride_row_x * sizeof(block_ptq1_0)) + pc;
++    }
++
++    float acc[NC][R];
++    float accg[NC][R];
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            acc[c][r]  = 0.0f;
++            accg[c][r] = 0.0f;
++        }
++    }
++
++    const int nsteps = nblk / 8;
++    int4 nxt[NL];
++#pragma unroll
++    for (int l = 0; l < NL; ++l) {
++        nxt[l] = __ldg(src[l]);
++    }
++    const int * smw = (const int *) sm[warp];
++    for (int st = 0; st < nsteps; ++st) {
++        __syncwarp();
++#pragma unroll
++        for (int l = 0; l < NL; ++l) {
++            if (NCH % 32 == 0 || l * 32 + lane < NCH) {
++                sm[warp][l * 32 + lane] = nxt[l];
++            }
++        }
++        __syncwarp();
++        if (st + 1 < nsteps) {
++#pragma unroll
++            for (int l = 0; l < NL; ++l) {
++                nxt[l] = __ldg(src[l] + (st + 1) * 14);
++            }
++        }
++        const int kb = st * 8 + j;
++        const int4 * yc[NC];
++        float d8[NC][4];
++        int   is[NC][4];
++        // all-in-registers form (STREAM = false): the 32 q8 words of every column are loaded once per K-step and
++        // reused for all R rows of the lane, so the L1 -> register traffic per weight is 144 B * NC / R per block
++        int u[MODE == 1 ? 1 : NC][32];
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++            yc[c] = (const int4 *) (y + (size_t) c * stride_col_y_bytes) + kb;
++            const int4 dsq = __ldg(yc[c] + 8 * nblk_pt);
++            const int  dsw[4] = { dsq.x, dsq.y, dsq.z, dsq.w };
++#pragma unroll
++            for (int k = 0; k < 4; ++k) {
++                const half2 ds = *reinterpret_cast<const half2 *>(&dsw[k]);
++                d8[c][k] = __low2float(ds);
++                is[c][k] = (int) __half_as_short(__high2half(ds));
++            }
++            if constexpr (MODE != 1) {
++#pragma unroll
++                for (int t = 0; t < 8; ++t) {
++                    const int4 q = __ldg(yc[c] + t * nblk_pt);
++                    u[c][4 * t + 0] = q.x;
++                    u[c][4 * t + 1] = q.y;
++                    u[c][4 * t + 2] = q.z;
++                    u[c][4 * t + 3] = q.w;
++                }
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            uint32_t w[7];
++#pragma unroll
++            for (int i = 0; i < 7; ++i) {
++                w[i] = smw[(o * R + r) * 56 + j * 7 + i];
++            }
++            int sumi[NC][4];
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++#pragma unroll
++                for (int k = 0; k < 4; ++k) {
++                    sumi[c][k] = 0;
++                }
++            }
++            if constexpr (MODE == 1) {
++                ptq1_p61_block_isum_pt<NC>(w, yc, nblk_pt, sumi);
++            } else if constexpr (MODE == 2) {
++                ptq1_p61_block_isum_classic<NC>(w, u, sumi);
++            } else {
++                ptq1_p61_block_isum_mc<MODE == 1 ? 1 : NC>(w, u, sumi);
++            }
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                acc[c][r] += ptq1_p61_scale_dot(sumi[c], d8[c], is[c], w[6]);
++            }
++            if constexpr (has_gate) {
++#pragma unroll
++                for (int i = 0; i < 7; ++i) {
++                    w[i] = smw[4 * R * 56 + (o * R + r) * 56 + j * 7 + i];
++                }
++#pragma unroll
++                for (int c = 0; c < NC; ++c) {
++#pragma unroll
++                    for (int k = 0; k < 4; ++k) {
++                        sumi[c][k] = 0;
++                    }
++                }
++                if constexpr (MODE == 1) {
++                ptq1_p61_block_isum_pt<NC>(w, yc, nblk_pt, sumi);
++            } else if constexpr (MODE == 2) {
++                ptq1_p61_block_isum_classic<NC>(w, u, sumi);
++            } else {
++                ptq1_p61_block_isum_mc<MODE == 1 ? 1 : NC>(w, u, sumi);
++            }
++#pragma unroll
++                for (int c = 0; c < NC; ++c) {
++                    accg[c][r] += ptq1_p61_scale_dot(sumi[c], d8[c], is[c], w[6]);
++                }
++            }
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++#pragma unroll
++            for (int m = 1; m < 8; m <<= 1) {
++                acc[c][r] += __shfl_xor_sync(0xFFFFFFFF, acc[c][r], m);
++                if constexpr (has_gate) {
++                    accg[c][r] += __shfl_xor_sync(0xFFFFFFFF, accg[c][r], m);
++                }
++            }
++        }
++    }
++    const int row0 = rowW + o * R;
++    if (j == 0) {
++#pragma unroll
++        for (int c = 0; c < NC; ++c) {
++#pragma unroll
++            for (int r = 0; r < R; ++r) {
++                const int row = row0 + r;
++                if (row >= nrows) {
++                    continue;
++                }
++                float result = acc[c][r];
++                if (x_bias) {
++                    result += x_bias[c * stride_col_dst + row];
++                }
++                if constexpr (has_gate) {
++                    float gate_value = accg[c][r];
++                    if (gate_bias) {
++                        gate_value += gate_bias[c * stride_col_dst + row];
++                    }
++                    switch (glu_op) {
++                        case GGML_GLU_OP_SWIGLU:       result *= ggml_cuda_op_silu_single(gate_value); break;
++                        case GGML_GLU_OP_GEGLU:        result *= ggml_cuda_op_gelu_single(gate_value); break;
++                        case GGML_GLU_OP_SWIGLU_OAI:   result  = ggml_cuda_op_swiglu_oai_single(gate_value, result); break;
++                        case GGML_GLU_OP_SWIGLU_CLAMP: result  = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit); break;
++                        default:                       result *= gate_value; break;
++                    }
++                }
++                dst[c * stride_col_dst + row] = result;
++            }
++        }
++    }
++}
++
++static int ggml_cuda_ptq1_0_p61_mc_max() {
++    // GGML_CUDA_PTQ1_P61_MC=0 sends 2-8 column calls back to the PT kernel; N > 0 takes calls with up to N columns (default 8)
++    static const int v = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_P61_MC");
++        return s == nullptr ? 8 : atoi(s);
++    }();
++    return v;
++}
++
++static int ggml_cuda_ptq1_0_p61_mc_env(const char * name, const int def) {
++    const char * s = getenv(name);
++    return s == nullptr ? def : atoi(s);
++}
++
++template <int NC, bool has_gate, int R, int MODE>
++static void mul_mat_vec_ptq1_0_p61_mc_launch_rs(
++        const void * vx, const char * y, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int nblk, const int nrows_x, const int stride_row_x, const int nblk_pt, const int stride_col_y_bytes,
++        const int stride_col_dst, cudaStream_t stream) {
++    constexpr int NW = 4;
++    const dim3 grid((nrows_x + 4 * R * NW - 1) / (4 * R * NW));
++    mul_mat_vec_ptq1_0_p61_mc<R, NW, NC, has_gate, MODE><<<grid, NW * WARP_SIZE, 0, stream>>>(
++        vx, has_gate ? fusion.gate : nullptr, y, (const float *) fusion.x_bias, has_gate ? (const float *) fusion.gate_bias : nullptr,
++        fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x, nblk_pt, stride_col_y_bytes, stride_col_dst);
++}
++
++template <int NC>
++static void mul_mat_vec_ptq1_0_p61_mc_launch(
++        const void * vx, const char * y, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int nblk, const int nrows_x, const int stride_row_x, const int nblk_pt, const int stride_col_y_bytes,
++        const int stride_col_dst, cudaStream_t stream) {
++    // GGML_CUDA_PTQ1_P61_MC_R: rows per lane (1, 2, 4; default 2 for <= 3 columns, 4 for 4); GGML_CUDA_PTQ1_P61_MC_MODE: 0 = H-trick, activations in
++    // registers; 1 = H-trick, plane-streaming activations; 2 = classic digit walk, activations in registers
++    // defaults from the P104 sweep (test-backend-ops perf, 17408x5120 / 5120x17408 / 10240x5120): classic walk, 2 rows per
++    // lane up to 3 columns, 4 rows per lane at 4 columns (more rows -> register spills, fewer -> L1->register traffic bound)
++    static const int R_env = ggml_cuda_ptq1_0_p61_mc_env("GGML_CUDA_PTQ1_P61_MC_R", 0);
++    static const int mode  = ggml_cuda_ptq1_0_p61_mc_env("GGML_CUDA_PTQ1_P61_MC_MODE", 2);
++    const int R = R_env > 0 ? R_env : (NC >= 4 ? 4 : 2);
++#define P61_MC_L(G, RR, S) mul_mat_vec_ptq1_0_p61_mc_launch_rs<NC, G, RR, S>(vx, y, fusion, dst, nblk, nrows_x, stride_row_x, nblk_pt, stride_col_y_bytes, stride_col_dst, stream)
++#define P61_MC_R(G, S) switch (R) { case 1: P61_MC_L(G, 1, S); break; case 2: P61_MC_L(G, 2, S); break; default: P61_MC_L(G, 4, S); break; }
++    const bool g = fusion.gate != nullptr;
++    if (mode == 1) {
++        if (g) { P61_MC_R(true, 1) } else { P61_MC_R(false, 1) }
++    } else if (mode == 0) {
++        if (g) { P61_MC_R(true, 0) } else { P61_MC_R(false, 0) }
++    } else {
++        if (g) { P61_MC_R(true, 2) } else { P61_MC_R(false, 2) }
++    }
++#undef P61_MC_R
++#undef P61_MC_L
++}
++
++// Plain 2D PTQ1_0 mat-vec with 2..8 columns on sm_61, PT activation layout. Returns false to fall back.
++static bool mul_mat_vec_ptq1_0_p61_mc_switch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int stride_col_y,
++        const int stride_col_dst, cudaStream_t stream) {
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc != GGML_CUDA_CC_DP4A || !ggml_cuda_ptq1_0_p61_enabled() ||
++        ncols_dst < 2 || ncols_dst > ggml_cuda_ptq1_0_p61_mc_max()) {
++        return false;
++    }
++    if (ncols_x % (8 * QK_PTQ1_0) != 0 || (stride_row_x * sizeof(block_ptq1_0)) % 16 != 0 || (uintptr_t) vx % 16 != 0 ||
++        (uintptr_t) fusion.gate % 16 != 0 || (uintptr_t) vy % 16 != 0 ||
++        fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr) {
++        return false;
++    }
++    const int nblk    = ncols_x / QK_PTQ1_0;
++    const int nblk_pt = ptq1_0_pt_nblk(ncols_x);
++    const int sy      = stride_col_y * (int) sizeof(block_q8_1);
++    if (sy % 16 != 0) {
++        return false;
++    }
++    // column groups of at most 4: weights are re-read per group, activations stay in registers
++    for (int c0 = 0; c0 < ncols_dst; ) {
++        const int left = ncols_dst - c0;
++        const int nc   = left >= 4 ? 4 : left; // 5 -> 4+1 ... handled by the NC=1 instantiation
++        const char * yc = (const char *) vy + (size_t) c0 * sy;
++        float      * dc = dst + (size_t) c0 * stride_col_dst;
++        ggml_cuda_mm_fusion_args_device fc = fusion;
++        if (fc.x_bias)    { fc.x_bias    = (const float *) fc.x_bias    + (size_t) c0 * stride_col_dst; }
++        if (fc.gate_bias) { fc.gate_bias = (const float *) fc.gate_bias + (size_t) c0 * stride_col_dst; }
++        switch (nc) {
++            case 1: mul_mat_vec_ptq1_0_p61_mc_launch<1>(vx, yc, fc, dc, nblk, nrows_x, stride_row_x, nblk_pt, sy, stride_col_dst, stream); break;
++            case 2: mul_mat_vec_ptq1_0_p61_mc_launch<2>(vx, yc, fc, dc, nblk, nrows_x, stride_row_x, nblk_pt, sy, stride_col_dst, stream); break;
++            case 3: mul_mat_vec_ptq1_0_p61_mc_launch<3>(vx, yc, fc, dc, nblk, nrows_x, stride_row_x, nblk_pt, sy, stride_col_dst, stream); break;
++            default: mul_mat_vec_ptq1_0_p61_mc_launch<4>(vx, yc, fc, dc, nblk, nrows_x, stride_row_x, nblk_pt, sy, stride_col_dst, stream); break;
++        }
++        c0 += nc;
++    }
++    return true;
++}
++
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+--- prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-23 21:23:43.535074704 +0100
++++ prism-pascal-arch2/ggml/src/ggml-cuda/mmvq.cu	2026-11-24 04:05:12.360804630 +0100
+@@ -1566,6 +1566,12 @@
+         // plain 2D PTQ1_0 mat-vec with 2-8 columns: dedicated kernel with full lane utilization,
+         // see mmvq-ptq1_0.cuh. One column takes the SoA path: the K-block-stationary kernel where it
+         // applies, otherwise the generic kernel below.
++        // sm_61, 2..8 columns (MTP / speculative verify): octet kernel, weights decoded once per <= 4 columns
++        if (!ids && y_layout == GGML_CUDA_Q8_1_PT && nchannels_dst == 1 && nsamples_dst == 1 &&
++            mul_mat_vec_ptq1_0_p61_mc_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
++                                             stride_col_y, stride_col_dst, stream)) {
++            return;
++        }
+         if (!ids && !y_soa && mul_mat_vec_ptq1_0_pt_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst,
+                                                  stride_row_x, stride_col_y, stride_col_dst,
+                                                  nchannels_dst, nsamples_dst, stream)) {
+--- prism-pascal-best/src/tests/test-backend-ops.cpp	2026-11-23 21:10:53.196183510 +0100
++++ prism-pascal-arch2/tests/test-backend-ops.cpp	2026-11-24 04:05:26.601829571 +0100
+@@ -12451,6 +12451,16 @@
+                                                             1, 1, false, with_bias, false, false, { 1, 1 }));
+     }
+ 
++    // arch2: sm_61 multi-column octet kernel, full Bonsai-2 27B PTQ1_0 shapes at verify widths 2..8, gate fusion 2..5
++    for (int64_t n = 2; n <= 8; ++n) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {1024, 5120}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++    for (int n : {2, 3, 4, 5}) {
++        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_PTQ1_0, GGML_GLU_OP_SWIGLU, 17408, n, 5120,
++                                                            false, 1, 1, false, false, true, false, {1, 1}));
++    }
+     // PTQ1_0 / PQ2_0 integer-dot mat-vec: Bonsai-2 shapes, odd row counts (row tail), batches and multi-column B
+     for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
+         for (int64_t k : {1024, 5120, 6144, 17408}) {
+@@ -14170,6 +14180,16 @@
+         }
+     }
+ 
++    // MTP study (P104, prism-pascal-mtp): verify widths 1..8 at every Bonsai-2 27B PTQ1_0 weight shape, the condensed
++    // output head, and the Q4_0 MTP head layer shapes
++    for (int64_t n = 1; n <= 8; ++n) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {142744, 5120}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{12288, 5120}, {1024, 5120}, {5120, 6144}, {17408, 5120}, {5120, 17408}, {5120, 10240}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++    }
+     // speculative decoding attention: the DFlash2 drafter block (hd 128, 8 KV heads x 4,
+     // 8 queries, 2048 sliding window) and the 27B target's verify (hd 256, 4 KV heads x 6)
+     for (int nb : {1, 8, 16}) {

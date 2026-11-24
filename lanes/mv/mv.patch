@@ -1,0 +1,481 @@
+diff -ruN -x build -x build2 -x '*.log' prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu prism-pascal-mv/src/ggml/src/ggml-cuda/mmvq.cu
+--- prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-23 21:23:43.535074704 +0100
++++ prism-pascal-mv/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-24 02:20:57.167525582 +0100
+@@ -6,6 +6,15 @@
+ #ifndef PTQ1_P61_NW
+ #define PTQ1_P61_NW 4  // warps per CTA
+ #endif
++#ifndef PTQ1_P61_PERSIST
++#define PTQ1_P61_PERSIST 0  // 0: one row group per warp; k>0: grid capped at k x resident CTAs (grid-stride loop)
++#endif
++#ifndef PTQ1_P61_S
++#define PTQ1_P61_S 1        // K-slices per warp (octets split K instead of rows), K <  16 steps
++#endif
++#ifndef PTQ1_P61_S_LONGK
++#define PTQ1_P61_S_LONGK 1  // same for K >= 16 steps
++#endif
+ #include "mmvq-ptq1_0-p61.cuh"
+ #include "mmvq-pq2_0.cuh"
+ #include "quantize.cuh"
+diff -ruN -x build -x build2 -x '*.log' prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh prism-pascal-mv/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh
+--- prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-23 22:26:18.008073180 +0100
++++ prism-pascal-mv/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-24 02:21:15.423384951 +0100
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <cstring>
++#include <algorithm>
+ // PTQ1_0 one-column mat-vec for sm_61 (GP104/GP102: P104-100, P40, GTX 10xx). See arch notes in micro/.
+ //
+ // Geometry: an "octet" of 8 lanes owns R consecutive rows; lane j of the octet walks K-blocks j, j+8, ...
+@@ -85,143 +87,231 @@
+     return __half2float(__ushort_as_half((unsigned short) (w6 >> 16))) * a;
+ }
+ 
+-// Load scheme: per K-step (8 blocks = 224 B per row) the warp fetches its 4*R rows (x2 with the gate matrix) with
+-// coalesced 16-byte loads one step ahead (software pipelining keeps ~3.5 KB per warp in flight), parks them in
+-// warp-private shared memory, and each lane then reads the 7 words of its own block. Measured on the P104: the
+-// 7 x LDG.32 stride-28 pattern caps near 240 GB/s from L1 sector throughput; 16-byte coalesced loads reach ~300.
+-template <int R, int NW, bool has_gate>
+-__launch_bounds__(NW * WARP_SIZE, 1)
++// Load scheme: per round the warp fetches, for each of its rows, S consecutive K-steps (S*224 contiguous bytes; a
++// K-step is 8 blocks = 224 B) with coalesced 16-byte loads one round ahead, parks them in warp-private shared memory,
++// and each lane then reads the 7 words of its own block. Measured on the P104: the 7 x LDG.32 stride-28 pattern caps
++// near 240 GB/s from L1 sector throughput; 16-byte coalesced loads reach ~300, longer contiguous runs do better still.
++//
++// Geometry: the 4 octets of a warp are 4/S row groups x S K-slices. Octet (og, ok) owns rows og*R .. og*R+R-1 of the
++// warp's RPW = 4R/S rows and K-steps t*S + ok. S = 1 is the original geometry (4 row groups, one K-step per round);
++// S = 2 / 4 halve / quarter the per-group serial length (tail of the last groups) and read 448 / 896 B runs per row, at
++// the price of idle octets in the last round when nsteps % S != 0 (K = 5120: 5 steps -> S = 2 wastes 1/6).
++//
++// Row groups: a warp walks groups g = global_warp, g + nwarps_total, ... (grid-stride). With the grid capped at the
++// resident CTA count (persistent mode) the prefetch runs on across the group boundary, so there is no per-CTA pipeline
++// fill/drain; with an uncapped grid every warp does exactly one group (the original behaviour).
++//
++// smem: one matrix is RPW rows x S*14 int4, with PI pad int4 per row group so the 7-word LDS reads of the 4 octets
++// start at word offsets congruent to {0, 8, 16, 24} mod 32 (lane j adds 7j; the 8-lane set {7j mod 32} tiles the
++// banks exactly with those four bases). Unpadded, the octets collide 2-way (R = 2) or 4-way (R = 4).
++static __host__ __device__ constexpr int ptq1_p61_pad_int4(const int R, const int S) {
++    // base word of row group og is og*(R*S*56 + 4*PI) (+ ok*56 for the K-slice); choose PI so the 4 octet bases tile.
++    for (int PI = 0; PI < 8; ++PI) {
++        const int X = (R * S * 56 + 4 * PI) % 32;
++        if (S == 1 && (X == 8 || X == 24)) { return PI; }     // bases 0, X, 2X, 3X
++        if (S == 2 && X == 16)             { return PI; }     // bases 0, 24, X, X + 24
++        if (S == 4)                        { return 0;  }     // bases 0, 24, 16, 8
++    }
++    return -1;
++}
++
++#ifndef PTQ1_P61_MINB
++#define PTQ1_P61_MINB  5  // min resident CTAs per SM asked of ptxas (register cap), single-matrix kernels
++#endif
++#ifndef PTQ1_P61_MINBG
++#define PTQ1_P61_MINBG 4  // same for the gate+up fused kernel
++#endif
++template <int R, int NW, int S, bool has_gate>
++__launch_bounds__(NW * WARP_SIZE, (has_gate ? (R == 4 ? 3 : PTQ1_P61_MINBG) : (R == 4 ? 4 : PTQ1_P61_MINB)) * 4 / NW)
+ static __global__ void mul_mat_vec_ptq1_0_p61(
+         const void * __restrict__ vx, const void * __restrict__ vgate, const int * __restrict__ y,
+         const float * __restrict__ x_bias, const float * __restrict__ gate_bias, const ggml_glu_op glu_op, const float glu_limit,
+         float * __restrict__ dst, const int nblk, const int nrows, const int stride_row_x) {
++    static_assert(S == 1 || S == 2 || S == 4, "S must be 1, 2 or 4");
+     constexpr int NM  = has_gate ? 2 : 1;
+-    constexpr int NCH = NM * 4 * R * 14;         // 16-byte chunks per warp per K-step
+-    constexpr int NL  = (NCH + 31) / 32;         // 16-byte loads per lane per K-step
+-    __shared__ int4 sm[NW][NL * 32];
++    constexpr int NG  = 4 / S;                   // row groups per warp
++    constexpr int RPW = NG * R;                  // rows per warp (per group)
++    constexpr int CPR = S * 14;                  // 16-byte chunks per row per round
++    constexpr int CPM = RPW * CPR;               // chunks per matrix per round (= 4R*14 for every S)
++    constexpr int NCH = NM * CPM;                // chunks per warp per round
++    constexpr int NL  = (NCH + 31) / 32;         // 16-byte loads per lane per round
++    constexpr int PI  = ptq1_p61_pad_int4(R, S); // pad int4 per row group
++    static_assert(PI >= 0, "no bank-conflict-free pad found");
++    constexpr int MST = CPM + NG * PI;           // padded int4 stride of one matrix in smem
++    constexpr int RGW = R * S * 56 + 4 * PI;     // words per row group in smem
++    __shared__ int4 sm[NW][NM * MST];
+ 
+     const int lane = threadIdx.x & 31;
+     const int warp = threadIdx.x >> 5;
+     const int j    = lane & 7;
+     const int o    = lane >> 3;
+-    const int rowW = (blockIdx.x * NW + warp) * 4 * R;
++    const int og   = o / S;                      // row group of this octet
++    const int ok   = o % S;                      // K-slice of this octet
+ 
+-    const int4 * src[NL];
++    const int ngroups = (nrows + RPW - 1) / RPW;
++    const int gstride = gridDim.x * NW;
++    int       g       = blockIdx.x * NW + warp;
++    if (g >= ngroups) {
++        return;
++    }
++
++    // chunk c = l*32 + lane of a round is (matrix m, row-in-group rr, byte piece rem*16 of the row's S*224-B run).
++    // Per load l a lane keeps its smem slot and a 32-bit byte offset into the matrix (recomputed per row group; weights
++    // per matrix < 4 GB, checked by the caller), plus bit masks: which loads hit the gate matrix, and each load's K-slice
++    // (2 bits) so the loads of K-steps past nblk in the last round are skipped.
++    const uint32_t rowbytes = (uint32_t) stride_row_x * sizeof(block_ptq1_0);
++    int      cslot[NL];
++    uint32_t coff[NL];
++    uint32_t gmask  = 0;
++    uint32_t ksbits = 0;
+ #pragma unroll
+     for (int l = 0; l < NL; ++l) {
+-        const int c  = l * 32 + lane;
+-        const int cc = c < NCH ? c : 0;
+-        const int m  = cc / (4 * R * 14);
+-        const int rr = (cc % (4 * R * 14)) / 14;
+-        const int pc = cc % 14;
+-        const int row = min(rowW + rr, nrows - 1);
+-        const char * base = (const char *) (m == 0 ? vx : vgate);
+-        src[l] = (const int4 *) (base + (size_t) row * stride_row_x * sizeof(block_ptq1_0)) + pc;
++        const int c   = l * 32 + lane;
++        const int cc  = c < NCH ? c : 0;
++        const int m   = cc / CPM;
++        const int rr  = (cc % CPM) / CPR;
++        const int rem = cc % CPR;
++        cslot[l] = m * MST + rr * CPR + (rr / R) * PI + rem;
++        gmask   |= (uint32_t) m << l;
++        ksbits  |= (uint32_t) (rem / 14) << (2 * l);
+     }
+-
+-    float acc[R];
+-    float accg[R];
++    auto set_src = [&](const int grp) {
+ #pragma unroll
+-    for (int r = 0; r < R; ++r) {
+-        acc[r]  = 0.0f;
+-        accg[r] = 0.0f;
+-    }
++        for (int l = 0; l < NL; ++l) {
++            const int c   = l * 32 + lane;
++            const int cc  = c < NCH ? c : 0;
++            const int rr  = (cc % CPM) / CPR;
++            const int rem = cc % CPR;
++            const int row = min(grp * RPW + rr, nrows - 1);
++            coff[l] = (uint32_t) row * rowbytes + rem * 16;
++        }
++    };
++    auto src = [&](const int l, const int t) -> const int4 * {
++        const char * base = (has_gate && ((gmask >> l) & 1)) ? (const char *) vgate : (const char *) vx;
++        return (const int4 *) (base + coff[l]) + t * CPR;
++    };
++    auto load_round = [&](int4 * nxt, const int t, const int nsteps) {
++#pragma unroll
++        for (int l = 0; l < NL; ++l) {
++            if (S == 1 || t * S + (int) ((ksbits >> (2 * l)) & 3) < nsteps) {
++                nxt[l] = __ldg(src(l, t));
++            }
++        }
++    };
+ 
+-    const int nsteps = nblk / 8;
++    const int nsteps  = nblk / 8;
++    const int nrounds = (nsteps + S - 1) / S;
+     int4 nxt[NL];
+-#pragma unroll
+-    for (int l = 0; l < NL; ++l) {
+-        nxt[l] = __ldg(src[l]);
+-    }
++    set_src(g);
++    load_round(nxt, 0, nsteps);
+     const int * smw = (const int *) sm[warp];
+-    for (int st = 0; st < nsteps; ++st) {
+-        __syncwarp();
++    const int   wo  = og * RGW + ok * 56 + j * 7;   // this lane's word offset of row og*R, its K-slice, block j
++
++    for (;;) {
++        float acc[R];
++        float accg[R];
+ #pragma unroll
+-        for (int l = 0; l < NL; ++l) {
+-            if (NCH % 32 == 0 || l * 32 + lane < NCH) {
+-                sm[warp][l * 32 + lane] = nxt[l];
+-            }
++        for (int r = 0; r < R; ++r) {
++            acc[r]  = 0.0f;
++            accg[r] = 0.0f;
+         }
+-        __syncwarp();
+-        if (st + 1 < nsteps) {
++        for (int t = 0; t < nrounds; ++t) {
++            __syncwarp();
+ #pragma unroll
+             for (int l = 0; l < NL; ++l) {
+-                nxt[l] = __ldg(src[l] + (st + 1) * 14);
++                if (NCH % 32 == 0 || l * 32 + lane < NCH) {
++                    sm[warp][cslot[l]] = nxt[l];
++                }
+             }
+-        }
+-        const int   kb = st * 8 + j;
+-        const int * yw = y + (kb >> 5) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + (kb & 31);
+-        int   u[32];
+-        float d8[4];
+-        int   is[4];
+-#pragma unroll
+-        for (int i = 0; i < 32; ++i) {
+-            u[i] = __ldg(yw + i * GGML_CUDA_PTQ1_Q8_GROUP_KB);
+-        }
++            __syncwarp();
++            if (t + 1 < nrounds) {
++                load_round(nxt, t + 1, nsteps);
++            } else if (g + gstride < ngroups) {
++                set_src(g + gstride);
++                load_round(nxt, 0, nsteps);
++            }
++            const int kst = t * S + ok;
++            if (S == 1 || kst < nsteps) {         // octet-uniform; only the last round can skip
++                const int   kb = kst * 8 + j;
++                const int * yw = y + (kb >> 5) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + (kb & 31);
++                int   u[32];
++                float d8[4];
++                int   is[4];
+ #pragma unroll
+-        for (int k = 0; k < 4; ++k) {
+-            const int   ds_bits = __ldg(yw + (32 + k) * GGML_CUDA_PTQ1_Q8_GROUP_KB);
+-            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
+-            d8[k] = __low2float(ds);
+-            is[k] = (int) __half_as_short(__high2half(ds));
+-        }
++                for (int i = 0; i < 32; ++i) {
++                    u[i] = __ldg(yw + i * GGML_CUDA_PTQ1_Q8_GROUP_KB);
++                }
+ #pragma unroll
+-        for (int r = 0; r < R; ++r) {
+-            uint32_t w[7];
++                for (int k = 0; k < 4; ++k) {
++                    const int   ds_bits = __ldg(yw + (32 + k) * GGML_CUDA_PTQ1_Q8_GROUP_KB);
++                    const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
++                    d8[k] = __low2float(ds);
++                    is[k] = (int) __half_as_short(__high2half(ds));
++                }
+ #pragma unroll
+-            for (int i = 0; i < 7; ++i) {
+-                w[i] = smw[(o * R + r) * 56 + j * 7 + i];
+-            }
+-            int sumi[4] = { 0, 0, 0, 0 };
+-            ptq1_p61_block_isum(w, u, sumi);
+-            acc[r] += ptq1_p61_scale_dot(sumi, d8, is, w[6]);
+-            if constexpr (has_gate) {
++                for (int r = 0; r < R; ++r) {
++                    uint32_t w[7];
+ #pragma unroll
+-                for (int i = 0; i < 7; ++i) {
+-                    w[i] = smw[4 * R * 56 + (o * R + r) * 56 + j * 7 + i];
++                    for (int i = 0; i < 7; ++i) {
++                        w[i] = smw[wo + r * (S * 56) + i];
++                    }
++                    int sumi[4] = { 0, 0, 0, 0 };
++                    ptq1_p61_block_isum(w, u, sumi);
++                    acc[r] += ptq1_p61_scale_dot(sumi, d8, is, w[6]);
++                    if constexpr (has_gate) {
++#pragma unroll
++                        for (int i = 0; i < 7; ++i) {
++                            w[i] = smw[MST * 4 + wo + r * (S * 56) + i];
++                        }
++                        int sg[4] = { 0, 0, 0, 0 };
++                        ptq1_p61_block_isum(w, u, sg);
++                        accg[r] += ptq1_p61_scale_dot(sg, d8, is, w[6]);
++                    }
+                 }
+-                int sg[4] = { 0, 0, 0, 0 };
+-                ptq1_p61_block_isum(w, u, sg);
+-                accg[r] += ptq1_p61_scale_dot(sg, d8, is, w[6]);
+             }
+         }
+-    }
++        // reduce over the 8 lanes of the octet, then over the S K-slice octets of the row group
+ #pragma unroll
+-    for (int r = 0; r < R; ++r) {
++        for (int r = 0; r < R; ++r) {
+ #pragma unroll
+-        for (int m = 1; m < 8; m <<= 1) {
+-            acc[r] += __shfl_xor_sync(0xFFFFFFFF, acc[r], m);
+-            if constexpr (has_gate) {
+-                accg[r] += __shfl_xor_sync(0xFFFFFFFF, accg[r], m);
++            for (int m = 1; m < 8 * S; m <<= 1) {
++                acc[r] += __shfl_xor_sync(0xFFFFFFFF, acc[r], m);
++                if constexpr (has_gate) {
++                    accg[r] += __shfl_xor_sync(0xFFFFFFFF, accg[r], m);
++                }
+             }
+         }
+-    }
+-    const int row0 = rowW + o * R;
+-    if (j == 0) {
++        const int row0 = g * RPW + og * R;
++        if (j == 0 && ok == 0) {
+ #pragma unroll
+-        for (int r = 0; r < R; ++r) {
+-            const int row = row0 + r;
+-            if (row >= nrows) {
+-                continue;
+-            }
+-            float result = acc[r];
+-            if (x_bias) {
+-                result += x_bias[row];
+-            }
+-            if constexpr (has_gate) {
+-                float gate_value = accg[r];
+-                if (gate_bias) {
+-                    gate_value += gate_bias[row];
++            for (int r = 0; r < R; ++r) {
++                const int row = row0 + r;
++                if (row >= nrows) {
++                    continue;
+                 }
+-                switch (glu_op) {
+-                    case GGML_GLU_OP_SWIGLU:       result *= ggml_cuda_op_silu_single(gate_value); break;
+-                    case GGML_GLU_OP_GEGLU:        result *= ggml_cuda_op_gelu_single(gate_value); break;
+-                    case GGML_GLU_OP_SWIGLU_OAI:   result  = ggml_cuda_op_swiglu_oai_single(gate_value, result); break;
+-                    case GGML_GLU_OP_SWIGLU_CLAMP: result  = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit); break;
+-                    default:                       result *= gate_value; break;
++                float result = acc[r];
++                if (x_bias) {
++                    result += x_bias[row];
+                 }
++                if constexpr (has_gate) {
++                    float gate_value = accg[r];
++                    if (gate_bias) {
++                        gate_value += gate_bias[row];
++                    }
++                    switch (glu_op) {
++                        case GGML_GLU_OP_SWIGLU:       result *= ggml_cuda_op_silu_single(gate_value); break;
++                        case GGML_GLU_OP_GEGLU:        result *= ggml_cuda_op_gelu_single(gate_value); break;
++                        case GGML_GLU_OP_SWIGLU_OAI:   result  = ggml_cuda_op_swiglu_oai_single(gate_value, result); break;
++                        case GGML_GLU_OP_SWIGLU_CLAMP: result  = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit); break;
++                        default:                       result *= gate_value; break;
++                    }
++                }
++                dst[row] = result;
+             }
+-            dst[row] = result;
++        }
++        g += gstride;
++        if (g >= ngroups) {
++            break;
+         }
+     }
+ }
+@@ -234,6 +324,92 @@
+     return enabled;
+ }
+ 
++// Geometry selection. Defaults below; override with GGML_CUDA_PTQ1_P61_CFG="R,NW,persist,S[;R,NW,persist,S[;...]]":
++// first quad = big single-matrix shapes, second = small ones (weights below GGML_CUDA_PTQ1_P61_SMALL bytes, default 8 MB),
++// third = gate+up fused, fourth = long-K shapes (nsteps >= GGML_CUDA_PTQ1_P61_LONGK, default 16; takes precedence over
++// big/small). persist = 0: one row group per warp (grid = ngroups / NW); k > 0: grid = k * resident CTAs.
++struct ptq1_p61_cfg {
++    int R, NW, persist, S;
++};
++struct ptq1_p61_cfgs {
++    ptq1_p61_cfg big, small, gate, longk;
++    size_t       small_bytes;
++    int          longk_steps;
++};
++static const ptq1_p61_cfgs & ggml_cuda_ptq1_0_p61_cfg() {
++    static const ptq1_p61_cfgs cfgs = [] {
++        ptq1_p61_cfgs c;
++        c.big   = { PTQ1_P61_R, PTQ1_P61_NW, PTQ1_P61_PERSIST, PTQ1_P61_S };
++        c.small = c.big;
++        c.gate  = c.big;
++        c.longk = { PTQ1_P61_R, PTQ1_P61_NW, PTQ1_P61_PERSIST, PTQ1_P61_S_LONGK };
++        c.small_bytes = 8u << 20;
++        c.longk_steps = 16;
++        if (const char * s = getenv("GGML_CUDA_PTQ1_P61_CFG")) {
++            ptq1_p61_cfg * slots[4] = { &c.big, &c.small, &c.gate, &c.longk };
++            int n = 0;
++            while (s && *s && n < 4) {
++                ptq1_p61_cfg v = { 2, 4, 0, 1 };
++                if (sscanf(s, "%d,%d,%d,%d", &v.R, &v.NW, &v.persist, &v.S) < 3) {
++                    break;
++                }
++                *slots[n] = v;
++                if (n == 0) { c.small = v; c.gate = v; c.longk = v; }
++                ++n;
++                s = strchr(s, ';');
++                if (s) { ++s; }
++            }
++        }
++        if (const char * s = getenv("GGML_CUDA_PTQ1_P61_SMALL")) {
++            c.small_bytes = (size_t) atoll(s);
++        }
++        if (const char * s = getenv("GGML_CUDA_PTQ1_P61_LONGK")) {
++            c.longk_steps = atoi(s);
++        }
++        return c;
++    }();
++    return cfgs;
++}
++
++template <int R, int NW, int S, bool has_gate>
++static void mul_mat_vec_ptq1_0_p61_launch(
++        const void * vx, const void * vgate, const int * y, const float * x_bias, const float * gate_bias,
++        const ggml_glu_op glu_op, const float glu_limit, float * dst, const int nblk, const int nrows, const int stride_row_x,
++        const int persist, cudaStream_t stream) {
++    static int resident = -1;   // resident CTAs on the whole device for this instantiation (persist mode)
++    if (resident < 0) {
++        int per_sm = 0;
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, mul_mat_vec_ptq1_0_p61<R, NW, S, has_gate>, NW * WARP_SIZE, 0));
++        resident = std::max(1, per_sm) * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    }
++    constexpr int RPW = (4 / S) * R;
++    const int ngroups = (nrows + RPW - 1) / RPW;
++    int grid = (ngroups + NW - 1) / NW;
++    if (persist > 0) {
++        grid = std::min(grid, persist * resident);
++    }
++    mul_mat_vec_ptq1_0_p61<R, NW, S, has_gate><<<grid, NW * WARP_SIZE, 0, stream>>>(
++        vx, vgate, y, x_bias, gate_bias, glu_op, glu_limit, dst, nblk, nrows, stride_row_x);
++}
++
++template <bool has_gate>
++static void mul_mat_vec_ptq1_0_p61_dispatch(
++        const ptq1_p61_cfg & c, const void * vx, const void * vgate, const int * y, const float * x_bias, const float * gate_bias,
++        const ggml_glu_op glu_op, const float glu_limit, float * dst, const int nblk, const int nrows, const int stride_row_x,
++        cudaStream_t stream) {
++#define PTQ1_P61_CASE(RR, NNW, SS) \
++    if (c.R == RR && c.NW == NNW && c.S == SS) { \
++        mul_mat_vec_ptq1_0_p61_launch<RR, NNW, SS, has_gate>(vx, vgate, y, x_bias, gate_bias, glu_op, glu_limit, dst, nblk, nrows, stride_row_x, c.persist, stream); \
++        return; \
++    }
++    PTQ1_P61_CASE(1, 4, 1) PTQ1_P61_CASE(2, 4, 1) PTQ1_P61_CASE(2, 2, 1) PTQ1_P61_CASE(4, 4, 1)
++    PTQ1_P61_CASE(1, 4, 2) PTQ1_P61_CASE(2, 4, 2) PTQ1_P61_CASE(2, 2, 2) PTQ1_P61_CASE(4, 4, 2)
++    PTQ1_P61_CASE(1, 4, 4) PTQ1_P61_CASE(2, 4, 4) PTQ1_P61_CASE(2, 2, 4) PTQ1_P61_CASE(4, 4, 4)
++#undef PTQ1_P61_CASE
++    // unknown config: default geometry
++    mul_mat_vec_ptq1_0_p61_launch<2, 4, 1, has_gate>(vx, vgate, y, x_bias, gate_bias, glu_op, glu_limit, dst, nblk, nrows, stride_row_x, c.persist, stream);
++}
++
+ // Returns false (caller falls back to the generic kernel) for anything but plain sm_61 one-column calls.
+ static bool mul_mat_vec_ptq1_0_p61_switch(
+         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+@@ -247,19 +423,20 @@
+         (uintptr_t) vx % 4 != 0 || (uintptr_t) fusion.gate % 4 != 0) {
+         return false;
+     }
++    if ((size_t) nrows_x * stride_row_x * sizeof(block_ptq1_0) >= (size_t) 1 << 32) {
++        return false;   // the kernel keeps 32-bit byte offsets into each matrix
++    }
+     const int  nblk     = ncols_x / QK_PTQ1_0;
+     const bool has_gate = fusion.gate != nullptr;
+     const float * x_bias    = (const float *) fusion.x_bias;
+     const float * gate_bias = has_gate ? (const float *) fusion.gate_bias : nullptr;
+-    constexpr int R  = PTQ1_P61_R;
+-    constexpr int NW = PTQ1_P61_NW;
+-    const dim3 grid((nrows_x + 4 * R * NW - 1) / (4 * R * NW));
++    const ptq1_p61_cfgs & cfgs = ggml_cuda_ptq1_0_p61_cfg();
++    const size_t bytes = (size_t) nrows_x * nblk * sizeof(block_ptq1_0);
+     if (has_gate) {
+-        mul_mat_vec_ptq1_0_p61<R, NW, true><<<grid, NW * WARP_SIZE, 0, stream>>>(
+-            vx, fusion.gate, (const int *) vy, x_bias, gate_bias, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
++        mul_mat_vec_ptq1_0_p61_dispatch<true>(cfgs.gate, vx, fusion.gate, (const int *) vy, x_bias, gate_bias, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x, stream);
+     } else {
+-        mul_mat_vec_ptq1_0_p61<R, NW, false><<<grid, NW * WARP_SIZE, 0, stream>>>(
+-            vx, nullptr, (const int *) vy, x_bias, nullptr, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
++        const ptq1_p61_cfg & c = nblk / 8 >= cfgs.longk_steps ? cfgs.longk : (bytes < cfgs.small_bytes ? cfgs.small : cfgs.big);
++        mul_mat_vec_ptq1_0_p61_dispatch<false>(c, vx, nullptr, (const int *) vy, x_bias, nullptr, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x, stream);
+     }
+     return true;
+ }

@@ -1,0 +1,8 @@
+#!/bin/bash
+# stop serving and resume the GPU job queue (runner + watchdog + timeout + health)
+systemctl stop bonsai-best; sleep 2
+nohup setsid /usr/local/sbin/gpuq-runner >/dev/null 2>&1 </dev/null & disown
+nohup setsid /usr/local/sbin/gpuq-watchdog >/dev/null 2>&1 </dev/null & disown
+nohup setsid /usr/local/sbin/gpuq-timeout >/dev/null 2>&1 </dev/null & disown
+nohup setsid /usr/local/sbin/gpuq-health >/dev/null 2>&1 </dev/null & disown
+echo "queue resumed: $(ls /home/mbx/longshot/tune/queue/pending | wc -l) pending"

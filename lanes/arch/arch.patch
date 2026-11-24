@@ -1,0 +1,397 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 96c6114b7..bf02a3775 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3220,7 +3220,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
+     static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") == nullptr ||
+                                     atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0;
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
++    // sm_61 included (as in optB): its PTQ1_0 mat-vecs read the same ggml_cuda_q8_1_layout_host layout (SOA_ISUM)
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_DP4A) {
+         return 0; // the PTQ1_0 mmvq predicate below is only meaningful there
+     }
+ 
+@@ -6792,7 +6793,8 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (graph->instances.empty()) {
+-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
++        // sm_61 included (upstream PR #27721): measured on the P104, a launch costs 3.9 us stand-alone vs 0.97 us in a graph
++        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_DP4A) {
+             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
+                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+             }
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+index bedec68a3..df29db8db 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+@@ -35,6 +35,22 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
++#if !defined(GGML_USE_HIP)
++    // PTQ1_0 on sm_61 (P104/P40/GTX10xx): dp4a MMQ, the ternary block is expanded to signed bytes in the tile loader.
++    // I = 128 rows per tile (from optB): the trit unpack is amortized over twice the columns of the PQ2_0/Q4_0 I = 64 tile
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++#endif
++
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index b2bfa4551..4c5bba929 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -348,11 +348,25 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
+         int q[5];
+ #    pragma unroll
+         for (int t = 0; t < 5; ++t) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DP4A
++            // sm_61: v*3 as an IADD3, and the digit->trit map {0,1,2} -> {-1,0,1}
++            // as a carry-free add + xor per byte instead of the emulated __vsub4
++            uint32_t w_lo, w_hi;
++            uint32_t t_lo, t_hi; // v+v+v -> one full-rate IADD3 (v*3 = 2 XMADs, (v<<1)+v = half-rate ISCADD)
++            asm volatile("add.u32 %0, %1, %1;" : "=r"(t_lo) : "r"(v_lo));
++            asm volatile("add.u32 %0, %1, %2;" : "=r"(w_lo) : "r"(t_lo), "r"(v_lo));
++            asm volatile("add.u32 %0, %1, %1;" : "=r"(t_hi) : "r"(v_hi));
++            asm volatile("add.u32 %0, %1, %2;" : "=r"(w_hi) : "r"(t_hi), "r"(v_hi));
++            v_lo = w_lo & 0x00FF00FF;
++            v_hi = w_hi & 0x00FF00FF;
++            q[t] = (int) ((__byte_perm(w_lo, w_hi, 0x7531) + 0x7F7F7F7Fu) ^ 0x80808080u);
++#else
+             const uint32_t w_lo = v_lo * 3;
+             const uint32_t w_hi = v_hi * 3;
+             v_lo = w_lo & 0x00FF00FF;
+             v_hi = w_hi & 0x00FF00FF;
+             q[t] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
++#endif
+             if (full_lane) {
+                 row[dst_base + t * dst_stride] = q[t];
+             }
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 2e6d73587..bc9d5c3d6 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -505,7 +505,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+     switch (type) {
+ #if !defined(GGML_USE_HIP)
+         case GGML_TYPE_PTQ1_0:
+-            mmq_supported = turing_mma_available(cc);
++            // sm_61 (dp4a, no tensor cores): dp4a MMQ instead of the fp16 dequantize + cuBLAS fallback
++            mmq_supported = turing_mma_available(cc) || (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DP4A);
+             break;
+ #endif
+         case GGML_TYPE_Q1_0:
+diff --git a/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh b/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh
+new file mode 100644
+index 000000000..b1dba0832
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh
+@@ -0,0 +1,267 @@
++#pragma once
++// PTQ1_0 one-column mat-vec for sm_61 (GP104/GP102: P104-100, P40, GTX 10xx). See arch notes in micro/.
++//
++// Geometry: an "octet" of 8 lanes owns R consecutive rows; lane j of the octet walks K-blocks j, j+8, ...
++// Every K in the model is a multiple of 1024 = 8 blocks, so all lanes stay busy for every shape (the
++// warp-per-row geometry leaves 24 of 32 lanes idle in the 2nd K-trip at K = 5120). The 4 octets of a warp
++// read the same activation words (broadcast, 1 wavefront), and the R rows of a lane share them, so the
++// activation LSU traffic per weight is 1/R of the warp-per-row kernel. Lanes of an octet read 8 adjacent
++// blocks (224 contiguous bytes per row), reduction is 3 xor-shuffles inside the octet.
++//
++// Decode ("H-trick"): with 16-bit lanes v = b (base-3 encoded byte), H_s = floor(b*3^s/256) is the high byte of
++// v*3^s, which never overflows 16 bits for s <= 5 (255*243 < 2^16), so no masking is needed. The digits are
++// d_t = H_{t+1} - 3*H_t, hence sum_t d_t*x_t = sum_{s=1..5} H_s*x_{s-1} - 3*sum_{s=1..4} H_s*x_s: per 4 trits one
++// shift-add pair, one byte_perm and two dp4a instead of two shift-adds, two masks, one byte_perm and one dp4a.
++// All integer sums are exact and identical to vec_dot_ptq1_0_q8_1_multi; only the fp32 summation order differs.
++// Activations: the GGML_CUDA_Q8_1_SOA_ISUM layout (ggml_cuda_ptq1_q8_word), digits in {0,1,2} with the -1 folded
++// into the exact per-32 int sums.
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
++// v*3 as v+v+v: the two dependent adds fuse into one IADD3, which is full rate on sm_61 (measured 128 lanes/clk/SM),
++// whereas v*3 becomes 2 XMADs and (v<<1)+v an ISCADD, both half rate (64 lanes/clk/SM). PRMT, SHF and BFE are half rate too.
++static __device__ __forceinline__ uint32_t ptq1_p61_mul3(const uint32_t v) {
++    uint32_t t, r;
++    asm volatile("add.u32 %0, %1, %1;" : "=r"(t) : "r"(v));
++    asm volatile("add.u32 %0, %1, %2;" : "=r"(r) : "r"(t), "r"(v));
++    return r;
++}
++
++static __device__ __forceinline__ int ptq1_p61_dp4a_us(const uint32_t a, const int b, const int c) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
++    int d;
++    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
++    return d;
++#else
++    GGML_UNUSED_VARS(a, b); NO_DEVICE_CODE; return c;
++#endif
++}
++
++// w: the 7 words of one block_ptq1_0 (qs[24], qh[2], d); u: the 32 q8 words of the matching K-block.
++static __device__ __forceinline__ void ptq1_p61_block_isum(const uint32_t * w, const int * u, int * sumi) {
++    int sb[4] = { 0, 0, 0, 0 };
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++        // 16-bit lanes: v_lo = [b0, b2] (one full-rate LOP), v_hi = [b1, b3] (one PRMT)
++        uint32_t v_lo = w[g] & 0x00FF00FFu;
++        uint32_t v_hi = __byte_perm(w[g], 0, 0x4341);
++#pragma unroll
++        for (int s = 1; s <= 5; ++s) {
++            v_lo = ptq1_p61_mul3(v_lo);
++            v_hi = ptq1_p61_mul3(v_hi);
++            const uint32_t H  = __byte_perm(v_lo, v_hi, 0x7351); // [H(b0), H(b1), H(b2), H(b3)]
++            const int      ea = g < 4 ? (s - 1) * 16 + 4 * g : 80 + (s - 1) * 8 + 4 * (g - 4);
++            if (s == 5) {
++                sumi[ea >> 5] = ptq1_p61_dp4a_us(H, u[ea >> 2], sumi[ea >> 5]); // H_5 is the full 0..242 code
++            } else {
++                sumi[ea >> 5] = ggml_cuda_dp4a((int) H, u[ea >> 2], sumi[ea >> 5]);
++                const int eb  = g < 4 ? s * 16 + 4 * g : 80 + s * 8 + 4 * (g - 4);
++                sb[eb >> 5]   = ggml_cuda_dp4a((int) H, u[eb >> 2], sb[eb >> 5]);
++            }
++        }
++    }
++#pragma unroll
++    for (int k = 0; k < 4; ++k) {
++        sumi[k] -= ptq1_p61_mul3((uint32_t) sb[k]);
++    }
++    // qh: 4 trits per byte, elements 120..127 (classic decode, 8 of 128 weights)
++    uint32_t v = (w[6] & 0xFFu) | ((w[6] & 0xFF00u) << 8);
++#pragma unroll
++    for (int t = 0; t < 4; t += 2) {
++        const uint32_t w0 = ptq1_p61_mul3(v);
++        v                 = w0 & 0x00FF00FF;
++        const uint32_t w1 = ptq1_p61_mul3(v);
++        v                 = w1 & 0x00FF00FF;
++        sumi[3] = ggml_cuda_dp4a(__byte_perm(w0, w1, 0x7531), u[30 + t / 2], sumi[3]);
++    }
++}
++
++static __device__ __forceinline__ float ptq1_p61_scale_dot(const int * sumi, const float * d8, const int * is, const uint32_t w6) {
++    float a = 0.0f;
++#pragma unroll
++    for (int k = 0; k < 4; ++k) {
++        a += d8[k] * (float) (sumi[k] - is[k]);
++    }
++    return __half2float(__ushort_as_half((unsigned short) (w6 >> 16))) * a;
++}
++
++// Load scheme: per K-step (8 blocks = 224 B per row) the warp fetches its 4*R rows (x2 with the gate matrix) with
++// coalesced 16-byte loads one step ahead (software pipelining keeps ~3.5 KB per warp in flight), parks them in
++// warp-private shared memory, and each lane then reads the 7 words of its own block. Measured on the P104: the
++// 7 x LDG.32 stride-28 pattern caps near 240 GB/s from L1 sector throughput; 16-byte coalesced loads reach ~300.
++template <int R, int NW, bool has_gate>
++__launch_bounds__(NW * WARP_SIZE, 1)
++static __global__ void mul_mat_vec_ptq1_0_p61(
++        const void * __restrict__ vx, const void * __restrict__ vgate, const int * __restrict__ y,
++        const float * __restrict__ x_bias, const float * __restrict__ gate_bias, const ggml_glu_op glu_op, const float glu_limit,
++        float * __restrict__ dst, const int nblk, const int nrows, const int stride_row_x) {
++    constexpr int NM  = has_gate ? 2 : 1;
++    constexpr int NCH = NM * 4 * R * 14;         // 16-byte chunks per warp per K-step
++    constexpr int NL  = (NCH + 31) / 32;         // 16-byte loads per lane per K-step
++    __shared__ int4 sm[NW][NL * 32];
++
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int j    = lane & 7;
++    const int o    = lane >> 3;
++    const int rowW = (blockIdx.x * NW + warp) * 4 * R;
++
++    const int4 * src[NL];
++#pragma unroll
++    for (int l = 0; l < NL; ++l) {
++        const int c  = l * 32 + lane;
++        const int cc = c < NCH ? c : 0;
++        const int m  = cc / (4 * R * 14);
++        const int rr = (cc % (4 * R * 14)) / 14;
++        const int pc = cc % 14;
++        const int row = min(rowW + rr, nrows - 1);
++        const char * base = (const char *) (m == 0 ? vx : vgate);
++        src[l] = (const int4 *) (base + (size_t) row * stride_row_x * sizeof(block_ptq1_0)) + pc;
++    }
++
++    float acc[R];
++    float accg[R];
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        acc[r]  = 0.0f;
++        accg[r] = 0.0f;
++    }
++
++    const int nsteps = nblk / 8;
++    int4 nxt[NL];
++#pragma unroll
++    for (int l = 0; l < NL; ++l) {
++        nxt[l] = __ldg(src[l]);
++    }
++    const int * smw = (const int *) sm[warp];
++    for (int st = 0; st < nsteps; ++st) {
++        __syncwarp();
++#pragma unroll
++        for (int l = 0; l < NL; ++l) {
++            if (NCH % 32 == 0 || l * 32 + lane < NCH) {
++                sm[warp][l * 32 + lane] = nxt[l];
++            }
++        }
++        __syncwarp();
++        if (st + 1 < nsteps) {
++#pragma unroll
++            for (int l = 0; l < NL; ++l) {
++                nxt[l] = __ldg(src[l] + (st + 1) * 14);
++            }
++        }
++        const int   kb = st * 8 + j;
++        const int * yw = y + (kb >> 5) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS + (kb & 31);
++        int   u[32];
++        float d8[4];
++        int   is[4];
++#pragma unroll
++        for (int i = 0; i < 32; ++i) {
++            u[i] = __ldg(yw + i * GGML_CUDA_PTQ1_Q8_GROUP_KB);
++        }
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const int   ds_bits = __ldg(yw + (32 + k) * GGML_CUDA_PTQ1_Q8_GROUP_KB);
++            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
++            d8[k] = __low2float(ds);
++            is[k] = (int) __half_as_short(__high2half(ds));
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            uint32_t w[7];
++#pragma unroll
++            for (int i = 0; i < 7; ++i) {
++                w[i] = smw[(o * R + r) * 56 + j * 7 + i];
++            }
++            int sumi[4] = { 0, 0, 0, 0 };
++            ptq1_p61_block_isum(w, u, sumi);
++            acc[r] += ptq1_p61_scale_dot(sumi, d8, is, w[6]);
++            if constexpr (has_gate) {
++#pragma unroll
++                for (int i = 0; i < 7; ++i) {
++                    w[i] = smw[4 * R * 56 + (o * R + r) * 56 + j * 7 + i];
++                }
++                int sg[4] = { 0, 0, 0, 0 };
++                ptq1_p61_block_isum(w, u, sg);
++                accg[r] += ptq1_p61_scale_dot(sg, d8, is, w[6]);
++            }
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++#pragma unroll
++        for (int m = 1; m < 8; m <<= 1) {
++            acc[r] += __shfl_xor_sync(0xFFFFFFFF, acc[r], m);
++            if constexpr (has_gate) {
++                accg[r] += __shfl_xor_sync(0xFFFFFFFF, accg[r], m);
++            }
++        }
++    }
++    const int row0 = rowW + o * R;
++    if (j == 0) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const int row = row0 + r;
++            if (row >= nrows) {
++                continue;
++            }
++            float result = acc[r];
++            if (x_bias) {
++                result += x_bias[row];
++            }
++            if constexpr (has_gate) {
++                float gate_value = accg[r];
++                if (gate_bias) {
++                    gate_value += gate_bias[row];
++                }
++                switch (glu_op) {
++                    case GGML_GLU_OP_SWIGLU:       result *= ggml_cuda_op_silu_single(gate_value); break;
++                    case GGML_GLU_OP_GEGLU:        result *= ggml_cuda_op_gelu_single(gate_value); break;
++                    case GGML_GLU_OP_SWIGLU_OAI:   result  = ggml_cuda_op_swiglu_oai_single(gate_value, result); break;
++                    case GGML_GLU_OP_SWIGLU_CLAMP: result  = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit); break;
++                    default:                       result *= gate_value; break;
++                }
++            }
++            dst[row] = result;
++        }
++    }
++}
++
++static bool ggml_cuda_ptq1_0_p61_enabled() {
++    static const bool enabled = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_P61");
++        return s == nullptr || atoi(s) != 0;
++    }();
++    return enabled;
++}
++
++// Returns false (caller falls back to the generic kernel) for anything but plain sm_61 one-column calls.
++static bool mul_mat_vec_ptq1_0_p61_switch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc != GGML_CUDA_CC_DP4A || !ggml_cuda_ptq1_0_p61_enabled()) {
++        return false;
++    }
++    if (ncols_x % (8 * QK_PTQ1_0) != 0 || (stride_row_x * sizeof(block_ptq1_0)) % 16 != 0 || (uintptr_t) vx % 16 != 0 ||
++        (uintptr_t) fusion.gate % 16 != 0 || fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr ||
++        (uintptr_t) vx % 4 != 0 || (uintptr_t) fusion.gate % 4 != 0) {
++        return false;
++    }
++    const int  nblk     = ncols_x / QK_PTQ1_0;
++    const bool has_gate = fusion.gate != nullptr;
++    const float * x_bias    = (const float *) fusion.x_bias;
++    const float * gate_bias = has_gate ? (const float *) fusion.gate_bias : nullptr;
++    constexpr int R  = PTQ1_P61_R;
++    constexpr int NW = PTQ1_P61_NW;
++    const dim3 grid((nrows_x + 4 * R * NW - 1) / (4 * R * NW));
++    if (has_gate) {
++        mul_mat_vec_ptq1_0_p61<R, NW, true><<<grid, NW * WARP_SIZE, 0, stream>>>(
++            vx, fusion.gate, (const int *) vy, x_bias, gate_bias, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
++    } else {
++        mul_mat_vec_ptq1_0_p61<R, NW, false><<<grid, NW * WARP_SIZE, 0, stream>>>(
++            vx, nullptr, (const int *) vy, x_bias, nullptr, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
++    }
++    return true;
++}
++
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 4121310f0..af7ccfb39 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,5 +1,12 @@
+ #include "mmvq.cuh"
+ #include "mmvq-ptq1_0.cuh"
++#ifndef PTQ1_P61_R
++#define PTQ1_P61_R  2  // rows per lane (sm_61 one-column PTQ1_0 kernel)
++#endif
++#ifndef PTQ1_P61_NW
++#define PTQ1_P61_NW 4  // warps per CTA
++#endif
++#include "mmvq-ptq1_0-p61.cuh"
+ #include "mmvq-pq2_0.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+@@ -1565,6 +1572,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             return;
+         }
+ #if !defined(GGML_USE_MUSA)
++        // plain 2D one column on sm_61: octet-per-row-group kernel (mmvq-ptq1_0-p61.cuh)
++        if (!ids && y_soa && ncols_dst == 1 && nchannels_dst == 1 && nsamples_dst == 1 &&
++            mul_mat_vec_ptq1_0_p61_switch(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream)) {
++            return;
++        }
+         // plain 2D one column on Hopper: K-block-stationary kernel, bit-exact with the generic one below
+         if (!ids && y_soa && ncols_dst == 1 && nchannels_dst == 1 && nsamples_dst == 1 &&
+             mul_mat_vec_ptq1_0_ks_switch(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream)) {

@@ -1,0 +1,274 @@
+diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq.cu
+--- /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-23 21:23:43.535074704 +0100
++++ /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-24 03:02:36.266946545 +0100
+@@ -328,11 +328,25 @@
+     return MMVQ_MAX_BATCH_SIZE;
+ }
+ 
++// sm_61 (P104, prism-pascal-mtp): PTQ1_0 MUL_MAT with this many columns or more goes to the dp4a MMQ tile kernel
++// instead of the multi-column PT mat-vec (GGML_CUDA_PTQ1_P61_MMQ_MIN, default 9 = never, i.e. the merged behaviour).
++static int ptq1_0_p61_mmq_min() {
++    static const int v = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_P61_MMQ_MIN");
++        const int    n = s ? atoi(s) : 0;
++        return n >= 2 ? n : MMVQ_MAX_BATCH_SIZE + 1;
++    }();
++    return v;
++}
++
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }
+ #if !defined(GGML_USE_HIP)
++    if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DP4A) {
++        return ne11 < ptq1_0_p61_mmq_min();
++    }
+     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
+         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
+         // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
+diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+--- /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh	2026-11-23 21:10:53.047261370 +0100
++++ /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh	2026-11-24 03:02:36.267422946 +0100
+@@ -249,9 +249,29 @@
+ // count.
+ // ---------------------------------------------------------------------------
+ 
++// sm_61 (prism-pascal-mtp): shared-memory budget (floats) for choosing rows per CTA, GGML_CUDA_PTQ1_PT_SMEM
++// (default PTQ1_0_PT_SMEM_FLOATS = the merged behaviour). Host-side only, the per-(row, K block) partials and
++// the epilogue order do not change, so the results are the same bits for every budget.
++static __host__ int ptq1_0_pt_smem_floats() {
++    static const int v = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_PT_SMEM");
++        const int    n = s ? atoi(s) : 0;
++        return n >= 512 ? n : PTQ1_0_PT_SMEM_FLOATS;
++    }();
++    return v;
++}
++
++// sm_61 (prism-pascal-mtp): rows per thread item for 2..4 and 5..8 columns, GGML_CUDA_PTQ1_PT_ROWS14 / _ROWS58
++// (2 or 4; defaults 4 / 2 = the merged behaviour). Only the work distribution changes, not the arithmetic.
++static __host__ int ptq1_0_pt_rows_knob(const char * name, const int def) {
++    const char * s = getenv(name);
++    const int    n = s ? atoi(s) : 0;
++    return (n == 2 || n == 4) ? n : def;
++}
++
+ // rows_per_cta: fill whole 128-thread iterations where possible, within the shared memory budget
+ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int ncols_dst, const int nrows_x, const int rows_per_item) {
+-    int rmax = PTQ1_0_PT_SMEM_FLOATS / (ncols_dst * (blocks_per_row + 1));
++    int rmax = ptq1_0_pt_smem_floats() / (ncols_dst * (blocks_per_row + 1));
+     rmax = rmax < rows_per_item ? rows_per_item : (rmax > PTQ1_0_PT_MAX_ROWS ? PTQ1_0_PT_MAX_ROWS : rmax);
+     rmax -= rmax % rows_per_item;
+     int best = rows_per_item;
+@@ -294,6 +314,11 @@
+     if (ncols_dst == 1 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == 860) {
+         return PTQ1_0_PT_ROWS_1;
+     }
++    if (ncols_dst > 1 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_DP4A) {
++        static const int rows14 = ptq1_0_pt_rows_knob("GGML_CUDA_PTQ1_PT_ROWS14", ptq1_0_pt_rows_per_item(2));
++        static const int rows58 = ptq1_0_pt_rows_knob("GGML_CUDA_PTQ1_PT_ROWS58", ptq1_0_pt_rows_per_item(5));
++        return ncols_dst <= 4 ? rows14 : rows58;
++    }
+     return ptq1_0_pt_rows_per_item(ncols_dst);
+ }
+ 
+@@ -563,13 +588,22 @@
+                         vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+             }
+             break;
+-        case 2: mul_mat_vec_ptq1_0_pt_launch<2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+-        case 3: mul_mat_vec_ptq1_0_pt_launch<3>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+-        case 4: mul_mat_vec_ptq1_0_pt_launch<4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+-        case 5: mul_mat_vec_ptq1_0_pt_launch<5>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+-        case 6: mul_mat_vec_ptq1_0_pt_launch<6>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+-        case 7: mul_mat_vec_ptq1_0_pt_launch<7>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+-        case 8: mul_mat_vec_ptq1_0_pt_launch<8>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
++#define PTQ1_0_PT_CASE(N)                                                                                               \
++        case N:                                                                                                           \
++            if (rows_per_item == 2) {                                                                                     \
++                mul_mat_vec_ptq1_0_pt_launch<N, 2>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); \
++            } else {                                                                                                      \
++                mul_mat_vec_ptq1_0_pt_launch<N, 4>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); \
++            }                                                                                                             \
++            break;
++        PTQ1_0_PT_CASE(2)
++        PTQ1_0_PT_CASE(3)
++        PTQ1_0_PT_CASE(4)
++        PTQ1_0_PT_CASE(5)
++        PTQ1_0_PT_CASE(6)
++        PTQ1_0_PT_CASE(7)
++        PTQ1_0_PT_CASE(8)
++#undef PTQ1_0_PT_CASE
+         default: return false;
+     }
+     return true;
+--- /home/mbx/CORE/llama/prism-pascal-best/src/tests/test-backend-ops.cpp	2026-11-23 21:10:53.196183510 +0100
++++ /home/mbx/CORE/llama/prism-pascal-mtp/src/tests/test-backend-ops.cpp	2026-11-24 01:54:36.945543399 +0100
+@@ -14170,6 +14170,17 @@
+         }
+     }
+ 
++    // MTP study (P104, prism-pascal-mtp): verify widths 1..8 at every Bonsai-2 27B PTQ1_0 weight shape, the condensed
++    // output head, and the Q4_0 MTP head layer shapes
++    for (int64_t n = 1; n <= 8; ++n) {
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}, {142744, 5120}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{12288, 5120}, {1024, 5120}, {5120, 6144}, {17408, 5120}, {5120, 17408}, {5120, 10240}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++
+     // speculative decoding attention: the DFlash2 drafter block (hd 128, 8 KV heads x 4,
+     // 8 queries, 2048 sliding window) and the 27B target's verify (hd 256, 4 KV heads x 6)
+     for (int nb : {1, 8, 16}) {
+--- /home/mbx/CORE/llama/prism-pascal-best/src/tools/server/server-context.cpp	2026-11-23 21:10:53.210838584 +0100
++++ /home/mbx/CORE/llama/prism-pascal-mtp/src/tools/server/server-context.cpp	2026-11-24 04:43:41.663334712 +0100
+@@ -293,6 +293,9 @@
+     common_speculative * spec;
+     int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
+ 
++    double spec_t_save_ms  = 0.0; // prism-pascal-mtp: last speculative checkpoint save (host copy or shadow seq)
++    size_t spec_save_bytes = 0;
++
+     llama_tokens spec_draft;
+ 
+     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+@@ -1084,6 +1087,15 @@
+     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+ 
++    // prism-pascal-mtp: LLAMA_SPEC_TIMING=1 prints the per-step cost of a speculative verify (checkpoint save, decode,
++    // host sampling, restore); LLAMA_SPEC_CKPT_DEVICE=1 keeps the target checkpoint on the device as a shadow sequence
++    // (seq id n_parallel + slot.id, unified KV) instead of a host copy of the recurrent state.
++    bool   spec_timing      = false;
++    bool   spec_ckpt_device = false;
++    double spec_t_decode_ms = 0.0; // last llama_process of the target
++    int    spec_n_decode    = 0;   // rows of that batch
++    llama_seq_id spec_shadow_seq(int slot_id) const { return (llama_seq_id) (params_base.n_parallel + slot_id); }
++
+     common_speculative_ptr spec;
+ 
+     bool add_bos_token = true;
+@@ -1296,7 +1308,22 @@
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        spec_timing      = getenv("LLAMA_SPEC_TIMING")      != nullptr && atoi(getenv("LLAMA_SPEC_TIMING"))      != 0;
++        spec_ckpt_device = getenv("LLAMA_SPEC_CKPT_DEVICE") != nullptr && atoi(getenv("LLAMA_SPEC_CKPT_DEVICE")) != 0;
++        if (spec_ckpt_device) {
++            if (!params_base.kv_unified) {
++                SRV_WRN("%s", "LLAMA_SPEC_CKPT_DEVICE: enabling the unified KV cache (seq_cp must not copy KV data)\n");
++                params_base.kv_unified = true;
++            }
++            // the target context gets one shadow sequence per slot; everything else keeps n_parallel slots
++            params_base.n_parallel *= 2;
++        }
+         llama_init = common_init_from_params(params_base);
++        if (spec_ckpt_device) {
++            params_base.n_parallel /= 2;
++            SRV_INF("LLAMA_SPEC_CKPT_DEVICE: speculative checkpoints are shadow sequences %d..%d on the device\n",
++                    params_base.n_parallel, 2*params_base.n_parallel - 1);
++        }
+ 
+         model_tgt = llama_init->model();
+         ctx_tgt   = llama_init->context();
+@@ -3887,12 +3914,22 @@
+                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
+ 
+                 if (use_ckpt_tgt) {
+-                    //const int64_t t_start = ggml_time_us();
++                    const int64_t t_start = ggml_time_us();
+ 
+-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    if (spec_ckpt_device) {
++                        auto * mem = llama_get_memory(ctx_tgt);
++                        const llama_seq_id shadow = spec_shadow_seq(slot.id);
++                        llama_memory_seq_rm(mem, shadow, -1, -1);              // free the previous shadow cell
++                        llama_memory_seq_cp(mem, slot.id, shadow, -1, -1);     // metadata only; the recurrent cell is
++                                                                               // split on the device by the next decode
++                        ckpt.data_tgt.assign(1, 0);                            // marker: checkpoint exists (empty() == false)
++                        slot.spec_save_bytes = 0;
++                    } else {
++                        ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                        slot.spec_save_bytes = ckpt.data_tgt.size();
++                    }
+ 
+-                    //const int64_t t_total = ggml_time_us() - t_start;
+-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
++                    slot.spec_t_save_ms = (ggml_time_us() - t_start) / 1000.0;
+ 
+                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+@@ -4635,10 +4672,13 @@
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
++            const int64_t t_dec0 = ggml_time_us();
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
++            spec_t_decode_ms = (ggml_time_us() - t_dec0) / 1000.0;
++            spec_n_decode    = batch.view.size();
+         });
+ 
+         if (ret != 0) {
+@@ -4897,6 +4937,7 @@
+                 // drafters that fill no distribution fall back here
+                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+ 
++                const int64_t t_smp0 = ggml_time_us();
+                 std::vector<llama_token> accepted;
+                 if (!synth_probs.empty()) {
+                     // synthetic acceptance replaces verification entirely, so it comes first
+@@ -4912,9 +4953,18 @@
+                 }
+ 
+                 GGML_ASSERT(accepted.size() >= 1);
++                const double t_smp_ms = (ggml_time_us() - t_smp0) / 1000.0;
+ 
+                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+ 
++                if (spec_timing) {
++                    SLT_INF(slot, "spec-timing: draft=%zu accepted=%zu replay=%d | ckpt_save %.1f ms (%.1f MiB%s) | decode %d rows %.1f ms | sample %.1f ms | rollback=%u\n",
++                            n_draft, accepted.size() - 1, (int) slot.spec_is_replay,
++                            slot.spec_t_save_ms, slot.spec_save_bytes / 1048576.0, spec_ckpt_device ? ", device" : "",
++                            spec_n_decode, spec_t_decode_ms, t_smp_ms, n_rollback);
++                    slot.spec_t_save_ms = 0.0; slot.spec_save_bytes = 0;
++                }
++
+                 const bool use_ckpt_tgt =
+                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+@@ -4934,13 +4984,28 @@
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
+-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++                        const int64_t t_rst0 = ggml_time_us();
++                        if (spec_ckpt_device) {
++                            // back to the shadow's cell: the slot's verified cell is dropped, the shadow cell is shared
++                            // again and split on the device by the replay decode
++                            auto * mem = llama_get_memory(slot.ctx_tgt);
++                            const llama_seq_id shadow = spec_shadow_seq(slot.id);
++                            llama_memory_seq_rm(mem, slot.id, -1, -1);
++                            llama_memory_seq_cp(mem, shadow, slot.id, -1, -1);
++                        } else {
++                            GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++                        }
+ 
+                         if (slot.ctx_dft) {
+                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                         }
+ 
+                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
++                        if (spec_timing) {
++                            SLT_INF(slot, "spec-timing: restore %.1f ms (%s) + replay of %zu accepted tokens follows\n",
++                                    (ggml_time_us() - t_rst0) / 1000.0, spec_ckpt_device ? "shadow seq" : "host copy",
++                                    slot.spec_draft.size());
++                        }
+ 
+                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                         common_sampler_copy(smpl_save.get(), slot.smpl.get());

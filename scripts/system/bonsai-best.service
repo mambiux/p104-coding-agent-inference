@@ -1,0 +1,19 @@
+[Unit]
+Description=Bonsai 27B coding-agent server on the P104 (merged Pascal kernels)
+After=network-online.target p104-power-cap.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mbx
+Environment=B=/home/mbx/CORE/llama/prism-pascal-best8/bin
+Environment=CTX=49152
+Environment=KVK=q4_0
+Environment=UB=256
+Environment=LLAMA_SPEC_CKPT_DEVICE_PLANE=1
+ExecStart=/home/mbx/longshot/bonsai-serve-best2.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

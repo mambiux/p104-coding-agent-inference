@@ -1,0 +1,11 @@
+#!/bin/bash
+# bonsai-cutover <bin-dir>  — pause the GPU job queue and start the Bonsai serving unit on the given build. Reversible: bonsai-queue-resume.
+B=${1:-/home/mbx/CORE/llama/prism-pascal-best4/bin}; Q=/home/mbx/longshot/tune/queue
+pkill -f gpuq-watchdo[g]; pkill -f gpuq-timeou[t]; pkill -f gpuq-healt[h]; pkill -f gpuq-runne[r]; sleep 1
+cur=$(cat $Q/current.pid 2>/dev/null); [ -n "$cur" ] && pkill -P $cur 2>/dev/null; for p in $(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader); do kill $p 2>/dev/null; done; sleep 4; for p in $(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader); do kill -9 $p 2>/dev/null; done; sleep 2
+j=$(ls $Q/running/*.job 2>/dev/null | head -1); [ -n "$j" ] && mv $j $Q/pending/ && echo "requeued interrupted job $(basename $j)"
+rm -f $Q/current.pid $Q/grace; echo "queue paused: $(ls $Q/pending | wc -l) jobs pending (resume with bonsai-queue-resume)"
+sed -i "s#^Environment=B=.*#Environment=B=$B#" /etc/systemd/system/bonsai-best.service; systemctl daemon-reload; systemctl enable --now bonsai-best.service >/dev/null 2>&1
+for i in $(seq 1 180); do curl -s -m2 http://127.0.0.1:8097/health 2>/dev/null | grep -q ok && break; sleep 1; done
+echo "bonsai-best: $(systemctl is-active bonsai-best) | build $B | health $(curl -s -m2 http://127.0.0.1:8097/health) | ctx $(grep -oE 'n_ctx_slot = [0-9]+' <(journalctl -u bonsai-best --no-pager -n 200 2>/dev/null) | tail -1) | VRAM $(nvidia-smi -i 0 --query-gpu=memory.used,power.limit --format=csv,noheader)"
+echo "web UI: http://$(tailscale ip -4 2>/dev/null):8097/  (LAN http://$(hostname -I | awk '{print $1}'):8097/)"

@@ -1,0 +1,737 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 96c6114b7..1b754b5c5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6792,7 +6792,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (graph->instances.empty()) {
+-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
++        // optA: Pascal dp4a (sm_61) runs CUDA graphs too (upstream #27721); GGML_CUDA_PASCAL_GRAPHS=0 restores the old gate
++        static const bool pascal_graphs = getenv("GGML_CUDA_PASCAL_GRAPHS") == nullptr || atoi(getenv("GGML_CUDA_PASCAL_GRAPHS")) != 0;
++        if (ggml_cuda_info().devices[cuda_ctx->device].cc < (pascal_graphs ? GGML_CUDA_CC_DP4A : GGML_CUDA_CC_VOLTA)) {
+             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
+                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+             }
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+index bedec68a3..1ddcb1b14 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+@@ -35,6 +35,19 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
++    // optA: PTQ1_0 on the dp4a MMQ path (tile loader expands trits to int8 in the Q8_0 SRAM layout)
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index b2bfa4551..e5a491678 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -348,8 +348,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
+         int q[5];
+ #    pragma unroll
+         for (int t = 0; t < 5; ++t) {
++#        if defined(TURING_MMA_AVAILABLE)
+             const uint32_t w_lo = v_lo * 3;
+             const uint32_t w_hi = v_hi * 3;
++#        else
++            // optA: dp4a (Pascal) path: x*3 as shl+add in PTX, a 32-bit multiply is an XMAD sequence there
++            uint32_t w_lo, w_hi;
++            asm("{\n\t.reg .u32 t;\n\tshl.b32 t, %1, 1;\n\tadd.u32 %0, t, %1;\n\t}" : "=r"(w_lo) : "r"(v_lo));
++            asm("{\n\t.reg .u32 t;\n\tshl.b32 t, %1, 1;\n\tadd.u32 %0, t, %1;\n\t}" : "=r"(w_hi) : "r"(v_hi));
++#        endif
+             v_lo = w_lo & 0x00FF00FF;
+             v_hi = w_hi & 0x00FF00FF;
+             q[t] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 2e6d73587..9f3cd004b 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -505,7 +505,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+     switch (type) {
+ #if !defined(GGML_USE_HIP)
+         case GGML_TYPE_PTQ1_0:
+-            mmq_supported = turing_mma_available(cc);
++            // optA: Pascal dp4a (sm_61/62) runs the PTQ1_0 MMQ tile path too; without it prefill
++            // falls back to dequantize + FP32 cuBLAS SGEMM
++            mmq_supported = turing_mma_available(cc) ||
++                (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA &&
++                 ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A);
+             break;
+ #endif
+         case GGML_TYPE_Q1_0:
+diff --git a/ggml/src/ggml-cuda/mmvq-ptq1_0-pascal.cuh b/ggml/src/ggml-cuda/mmvq-ptq1_0-pascal.cuh
+new file mode 100644
+index 000000000..142d11678
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-ptq1_0-pascal.cuh
+@@ -0,0 +1,574 @@
++// optA: PTQ1_0 one-column mat-vec for Pascal dp4a (sm_61/62), K-block-stationary with
++// coalesced, shared-memory-staged weight loads.
++//
++// The generic one-column kernel gives each lane one 128-weight block of a row, so on Bonsai 2 27B
++// (K = 5120 / 6144 / 17408 -> 40 / 48 / 136 blocks) 38-47% of lane slots idle in the last K pass,
++// every lane re-loads the 36 activation words of its block for every row, and the 7 weight words
++// of a block are fetched with 7 warp loads at a 28-byte lane stride (each touches ~28 sectors; GP104
++// caches plain global loads in L2 only). Here:
++//  * thread (g, kb) of the CTA owns K block kb and walks rows g, g+G, ...: all threads busy, the
++//    activation block stays in registers for every row of the CTA (as mul_mat_vec_ptq1_0_ks);
++//  * the CTA first copies its R weight rows (contiguous, 16-byte aligned) into shared memory with
++//    16-byte coalesced loads, then each thread reads the 7 words of its block from shared memory at
++//    a 7-word stride (gcd(7, 32) = 1, conflict-free).
++// The integer digit sums, the per (row, block) float partials and the epilogue order are exactly
++// those of mul_mat_vec_ptq1_0_ks, which replays the K partition of the generic kernel, so the
++// result is bit-identical with the generic one-column kernel.
++#pragma once
++
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
++
++// x * 3 as shift + add in PTX: LLVM otherwise canonicalizes (x << 1) + x into a multiply, and a
++// 32-bit integer multiply is an XMAD sequence on Pascal (measured ~6.5 XMAD per dp4a in the
++// multiply-based digit decode). ptxas turns shl + add into one ISCADD.
++static __device__ __forceinline__ uint32_t ptq1_0_pc_x3(const uint32_t x) {
++    uint32_t r;
++    asm("{\n\t.reg .u32 t;\n\tshl.b32 t, %1, 1;\n\tadd.u32 %0, t, %1;\n\t}" : "=r"(r) : "r"(x));
++    return r;
++}
++
++// Same integer digit sums and float expression as ptq1_0_ks_block_dot, but the base-3 digits are
++// produced by the remainder recurrence w = 3 v, digit = w >> 8, v = w & 0xFF on 16-bit lanes
++// (two ISCADD + two LOP + one PRMT per four digits, no multiplies).
++template <int ROWS>
++static __device__ __forceinline__ void ptq1_0_pc_block_dot(
++        const uint32_t (&w)[ROWS][7], const int (&ua)[36], float (&dd)[ROWS], float (&aa)[ROWS]) {
++    int sumi[ROWS][4];
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            sumi[i][k] = 0;
++        }
++    }
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            uint32_t vlo = __byte_perm(w[i][g], 0, 0x4140);
++            uint32_t vhi = __byte_perm(w[i][g], 0, 0x4342);
++#pragma unroll
++            for (int t = 0; t < 5; ++t) {
++                const uint32_t wlo = ptq1_0_pc_x3(vlo);
++                const uint32_t whi = ptq1_0_pc_x3(vhi);
++                vlo = wlo & 0x00FF00FF;
++                vhi = whi & 0x00FF00FF;
++                const int q = (int) __byte_perm(wlo, whi, 0x7531);
++                // qs[0..15]: element 16 t + 4 g + b; qs[16..23]: element 80 + 8 t + 4 (g - 4) + b
++                const int e = g < 4 ? 16*t + 4*g : 80 + 8*t + 4*(g - 4);
++                sumi[i][e >> 5] = ggml_cuda_dp4a(q, ua[(e >> 5)*8 + ((e & 31) >> 2)], sumi[i][e >> 5]);
++            }
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++        // qh: two bytes, four trits each, interleaved: element 120 + 2 t + h
++        uint32_t v = __byte_perm(w[i][6], 0, 0x4140);
++#pragma unroll
++        for (int t = 0; t < 4; t += 2) {
++            const uint32_t w0 = ptq1_0_pc_x3(v);
++            v                 = w0 & 0x00FF00FF;
++            const uint32_t w1 = ptq1_0_pc_x3(v);
++            v                 = w1 & 0x00FF00FF;
++            const int q = (int) __byte_perm(w0, w1, 0x7531);
++            sumi[i][3] = ggml_cuda_dp4a(q, ua[3*8 + 6 + t/2], sumi[i][3]);
++        }
++        float acc = 0.0f;
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const int   ds_bits = ua[32 + k];
++            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
++            const int   isum    = (int) __half_as_short(__high2half(ds));
++            acc += __low2float(ds) * (float) (sumi[i][k] - isum);
++        }
++        dd[i] = __half2float(__ushort_as_half((unsigned short) (w[i][6] >> 16)));
++        aa[i] = acc;
++    }
++}
++
++template <int G, int RPT, int ROWS, int LB, int MINB, bool has_fusion, bool has_gate>
++__launch_bounds__(LB, MINB)
++static __global__ void mul_mat_vec_ptq1_0_pc(
++        const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion, float * dst_,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const uint3 bpr_fd, const bool small_k_order) {
++    static_assert(RPT % ROWS == 0, "RPT must be a multiple of ROWS");
++    constexpr int R  = G * RPT;
++    constexpr int NM = has_gate ? 2 : 1;
++    const void * GGML_CUDA_RESTRICT vx  = vx_;
++    const void * GGML_CUDA_RESTRICT vy  = vy_;
++    float      * GGML_CUDA_RESTRICT dst = dst_;
++
++    extern __shared__ int4 ptq1_0_pc_smem[];
++    const int bpr   = ncols_x / QK_PTQ1_0;
++    const int rw    = bpr * 7;           // words per weight row
++    const int rw16  = rw / 4;            // int4 per weight row (bpr % 4 == 0)
++    const uint32_t * sw   = (const uint32_t *) ptq1_0_pc_smem;           // [NM][R][rw]
++    float2         * part = (float2 *) (ptq1_0_pc_smem + NM * R * rw16);  // [NM][R][bpr]
++
++    const int row0 = R * blockIdx.x;
++    const int nr   = min(R, nrows_x - row0);
++    const int g    = fastdiv((uint32_t) threadIdx.x, bpr_fd);
++    const int kb   = threadIdx.x - g*bpr;
++
++    // the weights do not depend on the preceding kernel: stage them before the PDL sync.
++    // Rows are contiguous when stride_row_x == bpr (every plain weight matrix): one linear copy of
++    // nr rows; otherwise row by row. Rows past nr are left unset, their results are never stored.
++#pragma unroll
++    for (int m = 0; m < NM; ++m) {
++        const char * base = (const char *) (m == 0 ? vx : fusion.gate);
++        int4 * dsts = ptq1_0_pc_smem + m * R * rw16;
++        if (stride_row_x == bpr) {
++            const int4 * src = (const int4 *) (base + (int64_t) row0 * rw * (int64_t) sizeof(uint32_t));
++            const int total = nr * rw16;
++            for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
++                dsts[idx] = __ldg(src + idx);
++            }
++        } else {
++            for (int r = 0; r < nr; ++r) {
++                const int4 * src = (const int4 *) (base + (int64_t) (row0 + r) * stride_row_x * (int64_t) sizeof(block_ptq1_0));
++                for (int j = threadIdx.x; j < rw16; j += blockDim.x) {
++                    dsts[r*rw16 + j] = __ldg(src + j);
++                }
++            }
++        }
++    }
++
++    // the activations are written by the preceding quantize kernel
++    ggml_cuda_pdl_sync();
++
++    int ua[36];
++    if (g < G) {
++        const int * yw = (const int *) vy + (kb / GGML_CUDA_PTQ1_Q8_GROUP_KB) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS
++                                          + kb % GGML_CUDA_PTQ1_Q8_GROUP_KB;
++#pragma unroll
++        for (int k = 0; k < 36; ++k) {
++            ua[k] = yw[k * GGML_CUDA_PTQ1_Q8_GROUP_KB];
++        }
++    }
++    __syncthreads();
++
++    if (g < G) {
++#pragma unroll
++        for (int j = 0; j < RPT; j += ROWS) {
++            uint32_t w[ROWS*NM][7];
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                const int r = g + G*(j + i); // rows past nr read unset shared memory, their result is not stored
++#pragma unroll
++                for (int m = 0; m < NM; ++m) {
++                    const uint32_t * p = sw + (m*R + r)*rw + kb*7;
++#pragma unroll
++                    for (int k = 0; k < 7; ++k) {
++                        w[i*NM + m][k] = p[k];
++                    }
++                }
++            }
++            float dd[ROWS*NM];
++            float aa[ROWS*NM];
++            ptq1_0_pc_block_dot<ROWS*NM>(w, ua, dd, aa);
++#pragma unroll
++            for (int i = 0; i < ROWS; ++i) {
++                const int r = g + G*(j + i);
++                if (r < nr) {
++#pragma unroll
++                    for (int m = 0; m < NM; ++m) {
++                        part[(m*R + r)*bpr + kb] = make_float2(dd[i*NM + m], aa[i*NM + m]);
++                    }
++                }
++            }
++        }
++    }
++    __syncthreads();
++
++    // epilogue: identical to mul_mat_vec_ptq1_0_ks
++    const int S    = small_k_order ? WARP_SIZE : 4*WARP_SIZE;
++    const int warp = threadIdx.x / WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++    for (int r = warp; r < nr; r += blockDim.x / WARP_SIZE) {
++        float sum[NM];
++#pragma unroll
++        for (int m = 0; m < NM; ++m) {
++            const float2 * p = part + (m*R + r)*bpr;
++            float tot = 0.0f;
++            for (int w0 = 0; w0 < S; w0 += WARP_SIZE) {
++                float a = 0.0f;
++                for (int k = w0 + lane; k < bpr; k += S) {
++                    const float2 v = p[k];
++                    a += v.x * v.y;
++                }
++                tot = w0 == 0 ? a : tot + a;
++            }
++            sum[m] = warp_reduce_sum<WARP_SIZE>(tot);
++        }
++        const int row = row0 + r;
++        if (lane == 0) {
++            float result = sum[0];
++            if constexpr (has_fusion) {
++                const float * x_bias    = (const float *) fusion.x_bias;
++                const float * gate_bias = (const float *) fusion.gate_bias;
++                if (small_k_order) {
++                    if (x_bias) {
++                        result += x_bias[row];
++                    }
++                    if constexpr (has_gate) {
++                        float gate_value = sum[NM - 1];
++                        if (gate_bias) {
++                            gate_value += gate_bias[row];
++                        }
++                        result = ptq1_0_ks_glu(fusion.glu_op, result, gate_value);
++                    }
++                } else {
++                    result += x_bias ? x_bias[row] : 0.0f;
++                    if constexpr (has_gate) {
++                        const float gate_value = sum[NM - 1] + (gate_bias ? gate_bias[row] : 0.0f);
++                        result = ptq1_0_ks_glu(fusion.glu_op, result, gate_value);
++                    }
++                }
++            }
++            dst[row] = result;
++        }
++    }
++}
++
++template <int G, int RPT, int ROWS, int LB, int MINB, bool GATE>
++static void mul_mat_vec_ptq1_0_pc_launch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const bool small_k_order, cudaStream_t stream) {
++    constexpr int R  = G * RPT;
++    constexpr int NM = GATE ? 2 : 1;
++    const int bpr = ncols_x / QK_PTQ1_0;
++    const int nthreads = (G*bpr + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
++    GGML_ASSERT(nthreads <= LB);
++    GGML_ASSERT(GATE == (fusion.gate != nullptr));
++    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
++    const size_t smem = (size_t) NM * R * bpr * 7 * sizeof(uint32_t) + (size_t) NM * R * bpr * sizeof(float2);
++    GGML_ASSERT(smem <= 48*1024);
++    const dim3 block_nums((nrows_x + R - 1) / R, 1, 1);
++    const dim3 block_dims(nthreads, 1, 1);
++    const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
++    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
++    if constexpr (GATE) {
++        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pc<G, RPT, ROWS, LB, MINB, true, true>, lp,
++            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, bpr_fd, small_k_order);
++    } else if (has_fusion) {
++        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pc<G, RPT, ROWS, LB, MINB, true, false>, lp,
++            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, bpr_fd, small_k_order);
++    } else {
++        ggml_cuda_kernel_launch(mul_mat_vec_ptq1_0_pc<G, RPT, ROWS, LB, MINB, false, false>, lp,
++            vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, bpr_fd, small_k_order);
++    }
++}
++
++
++// Persistent, software-pipelined variant: each CTA walks row tiles blockIdx.x, + gridDim.x, ...;
++// the global loads of the next tile are issued into registers before the current tile is computed
++// from shared memory (double buffer), so DRAM traffic overlaps the digit decode inside a CTA
++// instead of relying on other CTAs. The activations of the thread's K block are loaded once per CTA.
++// Same per (row, block) partials and epilogue as mul_mat_vec_ptq1_0_pc (bit-identical).
++// Requires contiguous rows (stride_row_x == blocks per row).
++template <int G, int RPT, int ROWS, int PF, int LB, int MINB, bool has_fusion, bool has_gate>
++__launch_bounds__(LB, MINB)
++static __global__ void mul_mat_vec_ptq1_0_pp(
++        const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion, float * dst_,
++        const int ncols_x, const int nrows_x, const uint3 bpr_fd, const bool small_k_order, const int ntiles) {
++    static_assert(RPT % ROWS == 0, "RPT must be a multiple of ROWS");
++    constexpr int R  = G * RPT;
++    constexpr int NM = has_gate ? 2 : 1;
++    const void * GGML_CUDA_RESTRICT vy  = vy_;
++    float      * GGML_CUDA_RESTRICT dst = dst_;
++
++    extern __shared__ int4 ptq1_0_pp_smem[];
++    const int bpr   = ncols_x / QK_PTQ1_0;
++    const int rw    = bpr * 7;
++    const int rw16  = rw / 4;
++    int4   * buf  = ptq1_0_pp_smem;                                   // [2][NM][R][rw16]
++    float2 * part = (float2 *) (ptq1_0_pp_smem + 2 * NM * R * rw16);  // [NM][R][bpr]
++
++    const int g  = fastdiv((uint32_t) threadIdx.x, bpr_fd);
++    const int kb = threadIdx.x - g*bpr;
++    const int4 * W[NM];
++    W[0] = (const int4 *) vx_;
++    if constexpr (NM == 2) {
++        W[NM - 1] = (const int4 *) fusion.gate;
++    }
++
++    int4 pf[NM][PF];
++    auto prefetch = [&](const int tile) {
++        const int row0  = tile * R;
++        const int total = min(R, nrows_x - row0) * rw16;
++#pragma unroll
++        for (int m = 0; m < NM; ++m) {
++            const int4 * src = W[m] + (int64_t) row0 * rw16;
++#pragma unroll
++            for (int p = 0; p < PF; ++p) {
++                const int idx = threadIdx.x + p*blockDim.x;
++                if (idx < total) {
++                    pf[m][p] = __ldg(src + idx);
++                }
++            }
++        }
++    };
++    auto store = [&](const int tile, const int b) {
++        const int total = min(R, nrows_x - tile * R) * rw16;
++#pragma unroll
++        for (int m = 0; m < NM; ++m) {
++#pragma unroll
++            for (int p = 0; p < PF; ++p) {
++                const int idx = threadIdx.x + p*blockDim.x;
++                if (idx < total) {
++                    buf[(b*NM + m)*R*rw16 + idx] = pf[m][p];
++                }
++            }
++        }
++    };
++
++    int tile = blockIdx.x;
++    prefetch(tile);
++    store(tile, 0);
++
++    ggml_cuda_pdl_sync();
++
++    int ua[36];
++    if (g < G) {
++        const int * yw = (const int *) vy + (kb / GGML_CUDA_PTQ1_Q8_GROUP_KB) * GGML_CUDA_PTQ1_Q8_GROUP_WORDS
++                                          + kb % GGML_CUDA_PTQ1_Q8_GROUP_KB;
++#pragma unroll
++        for (int k = 0; k < 36; ++k) {
++            ua[k] = yw[k * GGML_CUDA_PTQ1_Q8_GROUP_KB];
++        }
++    }
++    __syncthreads();
++
++    const int S    = small_k_order ? WARP_SIZE : 4*WARP_SIZE;
++    const int warp = threadIdx.x / WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++
++    for (int it = 0; tile < ntiles; ++it) {
++        const int next = tile + gridDim.x;
++        if (next < ntiles) {
++            prefetch(next);
++        }
++        const int row0 = tile * R;
++        const int nr   = min(R, nrows_x - row0);
++        const uint32_t * sw = (const uint32_t *) (buf + (it & 1)*NM*R*rw16);
++
++        if (g < G) {
++#pragma unroll
++            for (int j = 0; j < RPT; j += ROWS) {
++                uint32_t w[ROWS*NM][7];
++#pragma unroll
++                for (int i = 0; i < ROWS; ++i) {
++                    const int r = g + G*(j + i); // rows past nr read stale shared memory, never stored
++#pragma unroll
++                    for (int m = 0; m < NM; ++m) {
++                        const uint32_t * p = sw + (m*R + r)*rw + kb*7;
++#pragma unroll
++                        for (int k = 0; k < 7; ++k) {
++                            w[i*NM + m][k] = p[k];
++                        }
++                    }
++                }
++                float dd[ROWS*NM];
++                float aa[ROWS*NM];
++                ptq1_0_pc_block_dot<ROWS*NM>(w, ua, dd, aa);
++#pragma unroll
++                for (int i = 0; i < ROWS; ++i) {
++                    const int r = g + G*(j + i);
++                    if (r < nr) {
++#pragma unroll
++                        for (int m = 0; m < NM; ++m) {
++                            part[(m*R + r)*bpr + kb] = make_float2(dd[i*NM + m], aa[i*NM + m]);
++                        }
++                    }
++                }
++            }
++        }
++        __syncthreads();
++
++        for (int r = warp; r < nr; r += blockDim.x / WARP_SIZE) {
++            float sum[NM];
++#pragma unroll
++            for (int m = 0; m < NM; ++m) {
++                const float2 * p = part + (m*R + r)*bpr;
++                float tot = 0.0f;
++                for (int w0 = 0; w0 < S; w0 += WARP_SIZE) {
++                    float a = 0.0f;
++                    for (int k = w0 + lane; k < bpr; k += S) {
++                        const float2 v = p[k];
++                        a += v.x * v.y;
++                    }
++                    tot = w0 == 0 ? a : tot + a;
++                }
++                sum[m] = warp_reduce_sum<WARP_SIZE>(tot);
++            }
++            const int row = row0 + r;
++            if (lane == 0) {
++                float result = sum[0];
++                if constexpr (has_fusion) {
++                    const float * x_bias    = (const float *) fusion.x_bias;
++                    const float * gate_bias = (const float *) fusion.gate_bias;
++                    if (small_k_order) {
++                        if (x_bias) {
++                            result += x_bias[row];
++                        }
++                        if constexpr (has_gate) {
++                            float gate_value = sum[NM - 1];
++                            if (gate_bias) {
++                                gate_value += gate_bias[row];
++                            }
++                            result = ptq1_0_ks_glu(fusion.glu_op, result, gate_value);
++                        }
++                    } else {
++                        result += x_bias ? x_bias[row] : 0.0f;
++                        if constexpr (has_gate) {
++                            const float gate_value = sum[NM - 1] + (gate_bias ? gate_bias[row] : 0.0f);
++                            result = ptq1_0_ks_glu(fusion.glu_op, result, gate_value);
++                        }
++                    }
++                }
++                dst[row] = result;
++            }
++        }
++        if (next < ntiles) {
++            store(next, (it + 1) & 1);
++        }
++        __syncthreads();
++        tile = next;
++    }
++}
++
++template <int G, int RPT, int ROWS, int PF, int LB, int MINB, bool GATE>
++static void mul_mat_vec_ptq1_0_pp_launch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const bool small_k_order, cudaStream_t stream) {
++    constexpr int R  = G * RPT;
++    constexpr int NM = GATE ? 2 : 1;
++    const int bpr      = ncols_x / QK_PTQ1_0;
++    const int rw16     = bpr * 7 / 4;
++    const int nthreads = (G*bpr + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE;
++    GGML_ASSERT(nthreads <= LB);
++    GGML_ASSERT((R*rw16 + nthreads - 1) / nthreads <= PF);
++    GGML_ASSERT(GATE == (fusion.gate != nullptr));
++    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
++    const size_t smem = (size_t) 2 * NM * R * rw16 * sizeof(int4) + (size_t) NM * R * bpr * sizeof(float2);
++    GGML_ASSERT(smem <= 48*1024);
++    const int ntiles = (nrows_x + R - 1) / R;
++    const int device = ggml_cuda_get_device();
++    const int nsm    = ggml_cuda_info().devices[device].nsm;
++
++    auto run = [&](auto kernel) {
++        static int occ[GGML_CUDA_MAX_DEVICES] = {0};
++        static size_t occ_smem[GGML_CUDA_MAX_DEVICES] = {0};
++        if (occ[device] == 0 || occ_smem[device] != smem) {
++            int n = 0;
++            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, nthreads, smem));
++            occ[device] = std::max(n, 1);
++            occ_smem[device] = smem;
++        }
++        const dim3 block_nums(std::min(ntiles, nsm * occ[device]), 1, 1);
++        const dim3 block_dims(nthreads, 1, 1);
++        const uint3 bpr_fd = init_fastdiv_values((uint32_t) bpr);
++        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, smem, stream);
++        ggml_cuda_kernel_launch(kernel, lp, vx, vy, fusion, dst, ncols_x, nrows_x, bpr_fd, small_k_order, ntiles);
++    };
++    if constexpr (GATE) {
++        run(mul_mat_vec_ptq1_0_pp<G, RPT, ROWS, PF, LB, MINB, true, true>);
++    } else if (has_fusion) {
++        run(mul_mat_vec_ptq1_0_pp<G, RPT, ROWS, PF, LB, MINB, true, false>);
++    } else {
++        run(mul_mat_vec_ptq1_0_pp<G, RPT, ROWS, PF, LB, MINB, false, false>);
++    }
++}
++
++// GGML_CUDA_PTQ1_PC: 0 = off (generic kernel), 4 = persistent pipelined kernel (default),
++// 1-3 = non-persistent staged kernel geometries, 5 = alternative pipelined tile sizes
++static int ggml_cuda_ptq1_0_pc_mode() {
++    static const int mode = [] {
++        const char * env = getenv("GGML_CUDA_PTQ1_PC");
++        return env == nullptr ? 4 : atoi(env);
++    }();
++    return mode;
++}
++
++// true when the Pascal staged K-block-stationary kernel handled a plain 2D one-column call (SoA layout)
++static bool mul_mat_vec_ptq1_0_pc_switch(
++        const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
++        const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_DP4A || cc >= GGML_CUDA_CC_VOLTA || ggml_cuda_ptq1_0_pc_mode() == 0) {
++        return false;
++    }
++    if (ncols_x % QK_PTQ1_0 != 0 || fusion.x_scale != nullptr || fusion.gate_scale != nullptr) {
++        return false;
++    }
++    const int bpr = ncols_x / QK_PTQ1_0;
++    // 16-byte staging needs 16-byte aligned rows: bpr % 4 == 0 makes a row a 16-byte multiple
++    if (bpr % 4 != 0 || (uintptr_t) vx % 16 != 0 || (uintptr_t) fusion.gate % 16 != 0 ||
++        ((int64_t) stride_row_x * (int64_t) sizeof(block_ptq1_0)) % 16 != 0) {
++        return false;
++    }
++    const bool has_gate = fusion.gate != nullptr;
++    const int  cfg      = ggml_cuda_ptq1_0_pc_mode(); // see ggml_cuda_ptq1_0_pc_mode
++    if (cfg >= 4 && stride_row_x == bpr) {
++        // persistent pipelined kernel; cfg 5 = smaller tiles
++        if (bpr > 32 && bpr < 64) {
++            if (has_gate) {
++                if (cfg == 5) {
++                    mul_mat_vec_ptq1_0_pp_launch<4, 1, 1, 2, 256, 2, true>(vx, vy, fusion, dst, ncols_x, nrows_x, true, stream);
++                } else {
++                    mul_mat_vec_ptq1_0_pp_launch<4, 1, 1, 2, 256, 2, true>(vx, vy, fusion, dst, ncols_x, nrows_x, true, stream);
++                }
++            } else {
++                if (cfg == 5) {
++                    mul_mat_vec_ptq1_0_pp_launch<4, 1, 1, 2, 256, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, true, stream);
++                } else {
++                    mul_mat_vec_ptq1_0_pp_launch<4, 2, 2, 4, 256, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, true, stream);
++                }
++            }
++            return true;
++        }
++        if (bpr > 128 && bpr <= 160 && !has_gate) {
++            if (cfg == 5) {
++                mul_mat_vec_ptq1_0_pp_launch<1, 4, 2, 6, 160, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, false, stream);
++            } else {
++                // 2-row tiles: 99 vs 110 us on 5120 x 17408 (P104-100)
++                mul_mat_vec_ptq1_0_pp_launch<1, 2, 2, 3, 160, 3, false>(vx, vy, fusion, dst, ncols_x, nrows_x, false, stream);
++            }
++            return true;
++        }
++    }
++    if (bpr > 32 && bpr < 64) {
++        if (has_gate) {
++            if (cfg == 2) {
++                mul_mat_vec_ptq1_0_pc_launch<4, 1, 1, 256, 2, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
++            } else if (cfg == 3) {
++                mul_mat_vec_ptq1_0_pc_launch<4, 4, 1, 256, 2, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
++            } else {
++                mul_mat_vec_ptq1_0_pc_launch<4, 2, 1, 256, 2, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
++            }
++        } else {
++            if (cfg == 2) {
++                mul_mat_vec_ptq1_0_pc_launch<4, 2, 2, 256, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
++            } else if (cfg == 3) {
++                mul_mat_vec_ptq1_0_pc_launch<4, 8, 2, 256, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
++            } else {
++                mul_mat_vec_ptq1_0_pc_launch<4, 4, 2, 256, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
++            }
++        }
++        return true;
++    }
++    if (bpr > 128 && bpr <= 160 && !has_gate) {
++        if (cfg == 2) {
++            mul_mat_vec_ptq1_0_pc_launch<1, 4, 2, 160, 3, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream);
++        } else if (cfg == 3) {
++            mul_mat_vec_ptq1_0_pc_launch<2, 4, 2, 320, 1, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream);
++        } else {
++            mul_mat_vec_ptq1_0_pc_launch<1, 8, 2, 160, 3, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream);
++        }
++        return true;
++    }
++    return false;
++}
++
++#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+diff --git a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+index 4775f4f6b..8cf5bf792 100644
+--- a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
++++ b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+@@ -65,14 +65,26 @@ static __device__ __forceinline__ int int4_at(const int4 & v, const int k) {
+     }
+ }
+ 
++// optA: x * 3 for the digit recurrence. On Pascal (no full-rate IMAD) a 32-bit multiply is an
++// XMAD sequence, so emit shl + add in PTX there (ptxas: one ISCADD); other archs keep the multiply.
++static __device__ __forceinline__ uint32_t ptq1_0_x3(const uint32_t x) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++    uint32_t r;
++    asm("{\n\t.reg .u32 t;\n\tshl.b32 t, %1, 1;\n\tadd.u32 %0, t, %1;\n\t}" : "=r"(r) : "r"(x));
++    return r;
++#else
++    return x * 3;
++#endif
++}
++
+ // one base-3 digit step on four bytes held as two 16-bit-lane words:
+ // returns the raw digits (0, 1, 2) as four unsigned bytes, advances the remainders.
+ // The digit bias is not applied here: the dot product uses the digits as-is with a mixed-sign
+ // dp4a and subtracts the exact integer activation sum of the 32-block once (see ptq1_0_pt_block_dot),
+ // which is the same integer as the biased sum, two ALU ops per 4 weights cheaper.
+ static __device__ __forceinline__ uint32_t ptq1_0_trit_step(uint32_t & vlo, uint32_t & vhi) {
+-    const uint32_t wlo = vlo * 3;
+-    const uint32_t whi = vhi * 3;
++    const uint32_t wlo = ptq1_0_x3(vlo);
++    const uint32_t whi = ptq1_0_x3(vhi);
+     vlo = wlo & 0x00FF00FF;
+     vhi = whi & 0x00FF00FF;
+     return __byte_perm(wlo, whi, 0x7531);
+@@ -210,9 +222,9 @@ static __device__ __forceinline__ void ptq1_0_pt_block_dot(
+         uint32_t v = (uint32_t) bq[i]->qh[0] | ((uint32_t) bq[i]->qh[1] << 16);
+ #pragma unroll
+         for (int t = 0; t < 4; t += 2) {
+-            const uint32_t w0 = v * 3;
++            const uint32_t w0 = ptq1_0_x3(v);
+             v                 = w0 & 0x00FF00FF;
+-            const uint32_t w1 = v * 3;
++            const uint32_t w1 = ptq1_0_x3(v);
+             v                 = w1 & 0x00FF00FF;
+             const uint32_t q = __byte_perm(w0, w1, 0x7531);
+ #pragma unroll
+@@ -848,8 +860,11 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
+         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+         const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_HOPPER || cc >= GGML_CUDA_CC_BLACKWELL ||
+-        !ggml_cuda_ptq1_0_ks_enabled()) {
++    // optA: GGML_CUDA_PTQ1_KS_PASCAL=1 also runs it on Pascal dp4a (experiment knob)
++    static const bool ks_pascal = getenv("GGML_CUDA_PTQ1_KS_PASCAL") != nullptr && atoi(getenv("GGML_CUDA_PTQ1_KS_PASCAL")) != 0;
++    const bool arch_ok = (cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL) ||
++                         (ks_pascal && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA);
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !arch_ok || !ggml_cuda_ptq1_0_ks_enabled()) {
+         return false;
+     }
+     if (nrows_x < 4096 || ncols_x % QK_PTQ1_0 != 0 || fusion.x_scale != nullptr || fusion.gate_scale != nullptr ||
+@@ -874,3 +889,5 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
+ }
+ 
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++
++#include "mmvq-ptq1_0-pascal.cuh" // optA
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 4121310f0..781e7bed2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1566,6 +1566,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         }
+ #if !defined(GGML_USE_MUSA)
+         // plain 2D one column on Hopper: K-block-stationary kernel, bit-exact with the generic one below
++        // optA: Pascal dp4a one column: staged K-block-stationary kernel, bit-exact with the generic one
++        if (!ids && y_soa && ncols_dst == 1 && nchannels_dst == 1 && nsamples_dst == 1 &&
++            mul_mat_vec_ptq1_0_pc_switch(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream)) {
++            return;
++        }
+         if (!ids && y_soa && ncols_dst == 1 && nchannels_dst == 1 && nsamples_dst == 1 &&
+             mul_mat_vec_ptq1_0_ks_switch(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, stream)) {
+             return;

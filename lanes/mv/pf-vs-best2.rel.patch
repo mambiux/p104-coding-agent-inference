@@ -1,0 +1,143 @@
+diff -ruN -x build -x build2 -x '*.log' prism-pascal-best2/src/ggml/src/ggml-cuda/mmvq.cu prism-pascal-mv/src2/ggml/src/ggml-cuda/mmvq.cu
+--- ggml/src/ggml-cuda/mmvq.cu	2026-11-24 08:21:03.043609096 +0100
++++ ggml/src/ggml-cuda/mmvq.cu	2026-11-24 13:47:15.971578170 +0100
+@@ -6,6 +6,18 @@
+ #ifndef PTQ1_P61_NW
+ #define PTQ1_P61_NW 4  // warps per CTA
+ #endif
++#ifndef PTQ1_P61_PF
++#define PTQ1_P61_PF        2  // K-steps of weight loads in flight per warp, single-matrix one-column kernel (env GGML_CUDA_PTQ1_P61_PREFETCH)
++#endif
++#ifndef PTQ1_P61_PF_GATE
++#define PTQ1_P61_PF_GATE   2  // same for the gate+up fused kernel
++#endif
++#ifndef PTQ1_P61_MINB
++#define PTQ1_P61_MINB      4  // ptxas min CTAs/SM (register cap) for the PF=2 single-matrix kernel: 4 -> 128 regs, 1 -> none
++#endif
++#ifndef PTQ1_P61_MINB_GATE
++#define PTQ1_P61_MINB_GATE 3  // same for gate+up: 3 -> 168 regs, 1 -> none
++#endif
+ #include "mmvq-ptq1_0-p61.cuh"
+ #include "mmvq-pq2_0.cuh"
+ #include "quantize.cuh"
+diff -ruN -x build -x build2 -x '*.log' prism-pascal-best2/src/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh prism-pascal-mv/src2/ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh
+--- ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-24 13:43:23.268682808 +0100
++++ ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh	2026-11-24 13:47:15.971014145 +0100
+@@ -89,12 +89,18 @@
+ // coalesced 16-byte loads one step ahead (software pipelining keeps ~3.5 KB per warp in flight), parks them in
+ // warp-private shared memory, and each lane then reads the 7 words of its own block. Measured on the P104: the
+ // 7 x LDG.32 stride-28 pattern caps near 240 GB/s from L1 sector throughput; 16-byte coalesced loads reach ~300.
+-template <int R, int NW, bool has_gate>
+-__launch_bounds__(NW * WARP_SIZE, 1)
++// PF = K-steps of weight loads in flight per warp (software pipelining). PF = 1 is the original one-step-ahead scheme;
++// PF = 2 keeps two register batches (nxt: step st+1, nx2: step st+2) so each batch has two compute steps to land. Measured
++// on the P104 (probes with the loads removed): compute floor 52 us vs 92 us achieved for 17408x5120, i.e. the weight
++// stream was not hidden behind the decode; by Little's law ~36 KB/SM in flight at PF = 1 is below what 300 GB/s needs.
++// MINB = min resident CTAs/SM asked of ptxas (register cap; 1 = none, 4 = 128 regs at 128 threads).
++template <int R, int NW, bool has_gate, int PF, int MINB>
++__launch_bounds__(NW * WARP_SIZE, MINB)
+ static __global__ void mul_mat_vec_ptq1_0_p61(
+         const void * __restrict__ vx, const void * __restrict__ vgate, const int * __restrict__ y,
+         const float * __restrict__ x_bias, const float * __restrict__ gate_bias, const ggml_glu_op glu_op, const float glu_limit,
+         float * __restrict__ dst, const int nblk, const int nrows, const int stride_row_x) {
++    static_assert(PF == 1 || PF == 2, "PF must be 1 or 2");
+     constexpr int NM  = has_gate ? 2 : 1;
+     constexpr int NCH = NM * 4 * R * 14;         // 16-byte chunks per warp per K-step
+     constexpr int NL  = (NCH + 31) / 32;         // 16-byte loads per lane per K-step
+@@ -128,25 +134,22 @@
+     }
+ 
+     const int nsteps = nblk / 8;
+-    int4 nxt[NL];
+-#pragma unroll
+-    for (int l = 0; l < NL; ++l) {
+-        nxt[l] = __ldg(src[l]);
+-    }
+     const int * smw = (const int *) sm[warp];
+-    for (int st = 0; st < nsteps; ++st) {
++
++    // one K-step: park the batch `cur` (data of step st) in smem, refill `cur` with step st+PF, decode step st
++    auto k_step = [&](const int st, int4 (&cur)[NL]) {
+         __syncwarp();
+ #pragma unroll
+         for (int l = 0; l < NL; ++l) {
+             if (NCH % 32 == 0 || l * 32 + lane < NCH) {
+-                sm[warp][l * 32 + lane] = nxt[l];
++                sm[warp][l * 32 + lane] = cur[l];
+             }
+         }
+         __syncwarp();
+-        if (st + 1 < nsteps) {
++        if (st + PF < nsteps) {
+ #pragma unroll
+             for (int l = 0; l < NL; ++l) {
+-                nxt[l] = __ldg(src[l] + (st + 1) * 14);
++                cur[l] = __ldg(src[l] + (st + PF) * 14);
+             }
+         }
+         const int   kb = st * 8 + j;
+@@ -185,6 +188,31 @@
+                 accg[r] += ptq1_p61_scale_dot(sg, d8, is, w[6]);
+             }
+         }
++    };
++
++    int4 nxt[NL];                        // batch A: steps 0, PF, 2PF, ...
++    int4 nx2[PF == 2 ? NL : 1];          // batch B: steps 1, 3, 5, ... (PF = 2 only)
++#pragma unroll
++    for (int l = 0; l < NL; ++l) {
++        nxt[l] = __ldg(src[l]);
++    }
++    if constexpr (PF == 2) {
++        if (1 < nsteps) {
++#pragma unroll
++            for (int l = 0; l < NL; ++l) {
++                nx2[l] = __ldg(src[l] + 14);
++            }
++        }
++        for (int st = 0; st < nsteps; st += 2) {
++            k_step(st, nxt);
++            if (st + 1 < nsteps) {
++                k_step(st + 1, nx2);
++            }
++        }
++    } else {
++        for (int st = 0; st < nsteps; ++st) {
++            k_step(st, nxt);
++        }
+     }
+ #pragma unroll
+     for (int r = 0; r < R; ++r) {
+@@ -254,13 +282,30 @@
+     constexpr int R  = PTQ1_P61_R;
+     constexpr int NW = PTQ1_P61_NW;
+     const dim3 grid((nrows_x + 4 * R * NW - 1) / (4 * R * NW));
++    // GGML_CUDA_PTQ1_P61_PREFETCH="<single>[,<gate>]": 0/1 = original one-step prefetch, 2 = two steps in flight
++    // (default PTQ1_P61_PF / PTQ1_P61_PF_GATE); GGML_CUDA_PTQ1_P61_MINB="<single>[,<gate>]": ptxas CTA/SM floor (1 or 4; 3 for gate).
++    static const int pf_s = [] { int a = PTQ1_P61_PF, b = PTQ1_P61_PF_GATE; if (const char * e = getenv("GGML_CUDA_PTQ1_P61_PREFETCH")) { b = -1; sscanf(e, "%d,%d", &a, &b); if (b < 0) { b = a; } } return (a == 2 ? 2 : 1) | ((b == 2 ? 2 : 1) << 4); }();
++    static const int mb_s = [] { int a = PTQ1_P61_MINB, b = PTQ1_P61_MINB_GATE; if (const char * e = getenv("GGML_CUDA_PTQ1_P61_MINB")) { b = -1; sscanf(e, "%d,%d", &a, &b); if (b < 0) { b = a; } } return a | (b << 4); }();
++    const int pf = has_gate ? (pf_s >> 4) : (pf_s & 15);
++    const int mb = has_gate ? (mb_s >> 4) : (mb_s & 15);
++#define PTQ1_P61_LAUNCH(G, PFV, MBV, GATEP, GBP) \
++    if (pf == PFV && mb == MBV) { \
++        mul_mat_vec_ptq1_0_p61<R, NW, G, PFV, MBV><<<grid, NW * WARP_SIZE, 0, stream>>>( \
++            vx, GATEP, (const int *) vy, x_bias, GBP, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x); \
++        return true; \
++    }
+     if (has_gate) {
+-        mul_mat_vec_ptq1_0_p61<R, NW, true><<<grid, NW * WARP_SIZE, 0, stream>>>(
++        PTQ1_P61_LAUNCH(true, 2, 3, fusion.gate, gate_bias)
++        PTQ1_P61_LAUNCH(true, 2, 1, fusion.gate, gate_bias)
++        mul_mat_vec_ptq1_0_p61<R, NW, true, 1, 1><<<grid, NW * WARP_SIZE, 0, stream>>>(
+             vx, fusion.gate, (const int *) vy, x_bias, gate_bias, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
+     } else {
+-        mul_mat_vec_ptq1_0_p61<R, NW, false><<<grid, NW * WARP_SIZE, 0, stream>>>(
++        PTQ1_P61_LAUNCH(false, 2, 4, nullptr, nullptr)
++        PTQ1_P61_LAUNCH(false, 2, 1, nullptr, nullptr)
++        mul_mat_vec_ptq1_0_p61<R, NW, false, 1, 1><<<grid, NW * WARP_SIZE, 0, stream>>>(
+             vx, nullptr, (const int *) vy, x_bias, nullptr, fusion.glu_op, fusion.glu_limit, dst, nblk, nrows_x, stride_row_x);
+     }
++#undef PTQ1_P61_LAUNCH
+     return true;
+ }
+ 

@@ -1,0 +1,270 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 96c6114b7..8ac3708eb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3220,7 +3220,8 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
+     static const bool pq2_enabled = getenv("GGML_CUDA_FWHT_FUSION_PQ2") == nullptr ||
+                                     atoi(getenv("GGML_CUDA_FWHT_FUSION_PQ2")) != 0;
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_TURING) {
++    // optB: Pascal sm_61 included; its PTQ1_0 mat-vec consumers take the same ggml_cuda_q8_1_layout_host decision
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_DP4A) {
+         return 0; // the PTQ1_0 mmvq predicate below is only meaningful there
+     }
+ 
+@@ -6792,7 +6793,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+ 
+     if (graph->instances.empty()) {
+-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
++        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_DP4A) {
+             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
+                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+             }
+diff --git a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+index bedec68a3..7ecfbeb06 100644
+--- a/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-pascal-dp4a.cuh
+@@ -35,6 +35,19 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
++    // PTQ1_0 (optB): same dp4a tile geometry as PQ2_0; the ternary tile loader expands to signed bytes in the Q8_0 SRAM layout
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_PTQ1_0, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q4_0, 256, 2, 64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 2e6d73587..8d58dbc12 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -505,7 +505,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+     switch (type) {
+ #if !defined(GGML_USE_HIP)
+         case GGML_TYPE_PTQ1_0:
+-            mmq_supported = turing_mma_available(cc);
++            // optB: Pascal (sm_61, native dp4a) runs the dp4a tile kernel instead of dequantize-F32 + cuBLAS SGEMM
++            mmq_supported = turing_mma_available(cc) ||
++                            (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA &&
++                             ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A);
+             break;
+ #endif
+         case GGML_TYPE_Q1_0:
+diff --git a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+index 4775f4f6b..196be0ea3 100644
+--- a/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
++++ b/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+@@ -666,6 +666,90 @@ static __device__ __forceinline__ void ptq1_0_ks_block_dot(
+     }
+ }
+ 
++// optB, Pascal (sm_61): the F_{t+1} - 3 F_t decode above multiplies by 3^t with constants up to 243, which
++// ptxas emulates with XMAD sequences on sm_6x (measured 1700 XMAD per 256 dp4a in the sm_61 SASS of the
++// kernel above). Here the only multiply is x 3, a single shift-add (ISCADD), and the "- 3 F_t" is moved out of
++// the byte lanes into the integer accumulators: with P_t = floor(x 3^t / 256) (the high byte of the 16-bit
++// lane x 3^t, x 3^5 = 58806 < 65536 so no lane overflow)
++//     sum_t digit_t * a_t = sum_t (P_{t+1} - 3 P_t) a_t = A - 3 B,   A = sum_t P_{t+1} a_t,  B = sum_t P_t a_t
++// A and B are exact int32 dp4a sums (P_t < 243: unsigned x signed dp4a), so sumi = A - 3 B is the same integer
++// as the digit walk and the fp32 result is bit-identical. 10 shift-adds + 7 PRMT + 9 dp4a per 4 packed bytes.
++// x * 3 as an explicit shift-add. nvcc folds `(x << 1) + x` and `x * 3` into mul.lo, which ptxas lowers to
++// two XMAD on sm_6x (no 32-bit IMUL); the PTX pair below lowers to one ISCADD/LEA.
++static __device__ __forceinline__ uint32_t ptq1_0_mul3(const uint32_t x) {
++    uint32_t r;
++    asm("shl.b32 %0, %1, 1;\n\tadd.u32 %0, %0, %1;" : "=r"(r) : "r"(x));
++    return r;
++}
++
++template <int ROWS>
++static __device__ __forceinline__ void ptq1_0_ks_block_dot_ab(
++        const uint32_t (&w)[ROWS][7], const int (&ua)[36], float (&dd)[ROWS], float (&aa)[ROWS]) {
++    int A[ROWS][4];
++    int B[ROWS][4];
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            A[i][k] = 0;
++            B[i][k] = 0;
++        }
++    }
++#pragma unroll
++    for (int g = 0; g < 6; ++g) {
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            uint32_t lo = __byte_perm(w[i][g], 0, 0x4140); // bytes 0, 1 in 16-bit lanes
++            uint32_t hi = __byte_perm(w[i][g], 0, 0x4342); // bytes 2, 3
++            uint32_t Pp = 0;                               // P_0 = 0
++#pragma unroll
++            for (int t = 0; t < 5; ++t) {
++                lo = ptq1_0_mul3(lo); // x 3^(t+1)
++                hi = ptq1_0_mul3(hi);
++                const uint32_t Pn = __byte_perm(lo, hi, 0x7531); // P_{t+1} of the four bytes
++                // qs[0..15]: element 16 t + 4 g + b; qs[16..23]: element 80 + 8 t + 4 (g - 4) + b
++                const int e = g < 4 ? 16*t + 4*g : 80 + 8*t + 4*(g - 4);
++                const int u = ua[(e >> 5)*8 + ((e & 31) >> 2)];
++                A[i][e >> 5] = ggml_cuda_dp4a_us(Pn, u, A[i][e >> 5]);
++                if (t > 0) {
++                    B[i][e >> 5] = ggml_cuda_dp4a_us(Pp, u, B[i][e >> 5]);
++                }
++                Pp = Pn;
++            }
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++        // qh: two bytes, four trits each, element 120 + 2 t + h -> words 30, 31 of the activation block.
++        // Q_t = {P_t(qh0), P_t(qh1), P_{t+1}(qh0), P_{t+1}(qh1)}; pair p covers elements 120 + 2p .. 123 + 2p
++        const uint32_t w0 = __byte_perm(w[i][6], 0, 0x4140); // qh0, qh1 in 16-bit lanes (d is in the high half)
++        const uint32_t w1 = ptq1_0_mul3(w0);
++        const uint32_t w2 = ptq1_0_mul3(w1);
++        const uint32_t w3 = ptq1_0_mul3(w2);
++        const uint32_t w4 = ptq1_0_mul3(w3);
++        const uint32_t Q0 = __byte_perm(w0, w1, 0x7531);
++        const uint32_t Q1 = __byte_perm(w1, w2, 0x7531);
++        const uint32_t Q2 = __byte_perm(w2, w3, 0x7531);
++        const uint32_t Q3 = __byte_perm(w3, w4, 0x7531);
++        A[i][3] = ggml_cuda_dp4a_us(Q1, ua[3*8 + 6], A[i][3]);
++        B[i][3] = ggml_cuda_dp4a_us(Q0, ua[3*8 + 6], B[i][3]);
++        A[i][3] = ggml_cuda_dp4a_us(Q3, ua[3*8 + 7], A[i][3]);
++        B[i][3] = ggml_cuda_dp4a_us(Q2, ua[3*8 + 7], B[i][3]);
++
++        float acc = 0.0f;
++#pragma unroll
++        for (int k = 0; k < 4; ++k) {
++            const int   sumi    = A[i][k] - 3*B[i][k];
++            const int   ds_bits = ua[32 + k];
++            const half2 ds      = *reinterpret_cast<const half2 *>(&ds_bits);
++            const int   isum    = (int) __half_as_short(__high2half(ds));
++            acc += __low2float(ds) * (float) (sumi - isum);
++        }
++        dd[i] = __half2float(__ushort_as_half((unsigned short) (w[i][6] >> 16)));
++        aa[i] = acc;
++    }
++}
++
+ static __device__ __forceinline__ float ptq1_0_ks_glu(const ggml_glu_op op, float result, const float gate_value) {
+     switch (op) {
+         case GGML_GLU_OP_SWIGLU:
+@@ -735,7 +819,11 @@ static __global__ void mul_mat_vec_ptq1_0_ks(
+             }
+             float dd[ROWS*NM];
+             float aa[ROWS*NM];
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
++            ptq1_0_ks_block_dot_ab<ROWS*NM>(w, ua, dd, aa); // optB: no XMAD emulation on sm_6x
++#else
+             ptq1_0_ks_block_dot<ROWS*NM>(w, ua, dd, aa);
++#endif
+ #pragma unroll
+             for (int i = 0; i < ROWS; ++i) {
+                 const int r = g + G*(j + i);
+@@ -848,8 +936,12 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
+         const void * vx, const void * vy, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+         const int ncols_x, const int nrows_x, const int stride_row_x, cudaStream_t stream) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_HOPPER || cc >= GGML_CUDA_CC_BLACKWELL ||
+-        !ggml_cuda_ptq1_0_ks_enabled()) {
++    // optB: Pascal sm_61 (P104/GTX 10xx) also takes this kernel: the generic kernel re-reads 144 B of
++    // activations per 28 B weight block from L2 on Pascal (no L1 caching of global loads), which caps the
++    // GEMV far below GDDR bandwidth; here the activations are register-resident per K block.
++    const bool pascal_dp4a = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ggml_cuda_ptq1_0_ks_enabled() ||
++        !((cc >= GGML_CUDA_CC_HOPPER && cc < GGML_CUDA_CC_BLACKWELL) || pascal_dp4a)) {
+         return false;
+     }
+     if (nrows_x < 4096 || ncols_x % QK_PTQ1_0 != 0 || fusion.x_scale != nullptr || fusion.gate_scale != nullptr ||
+@@ -858,6 +950,44 @@ static bool mul_mat_vec_ptq1_0_ks_switch(
+     }
+     const int  bpr      = ncols_x / QK_PTQ1_0;
+     const bool has_gate = fusion.gate != nullptr;
++    if (pascal_dp4a) {
++        // optB, sm_61: the Hopper geometry (2 rows per thread, 8 rows per CTA) re-reads the 144 B activation
++        // block per thread for every 8 rows, 2.5x the weight bytes, which Pascal's L2 cannot afford. More rows
++        // per thread (RPT) amortize the register-resident activations over 16-64 rows per CTA.
++        // GGML_CUDA_PTQ1_KS_CFG selects the geometry for A/B tuning (0 = Hopper geometry everywhere, 1 = default: 8 rows per
++        // thread for the plain K = 33..63 block projections, Hopper geometry for gate fusion and K > 128 blocks, 2 = taller).
++        static const int cfg = [] {
++            const char * env = getenv("GGML_CUDA_PTQ1_KS_CFG");
++            return env ? atoi(env) : 1;
++        }();
++        if (bpr > 32 && bpr < 64) {
++            if (has_gate) {
++                // gate + up fused: the 1-row-per-thread, 4-rows-per-CTA geometry (64 regs, 6 CTAs/SM) measured faster
++                // in the full model than 4 rows per thread (llama-bench tg128 26.3 vs 20.5 with cfg 1 everywhere)
++                switch (cfg) {
++                    case 2:  mul_mat_vec_ptq1_0_ks_launch<4, 4, 1, 256, 3, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream); break;
++                    default: mul_mat_vec_ptq1_0_ks_launch<4, 1, 1, 256, 4, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream); break;
++                }
++            } else {
++                switch (cfg) {
++                    case 0:  mul_mat_vec_ptq1_0_ks_launch<4,  2, 2, 256, 4, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream); break;
++                    case 2:  mul_mat_vec_ptq1_0_ks_launch<4, 16, 2, 256, 2, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream); break;
++                    default: mul_mat_vec_ptq1_0_ks_launch<4,  8, 2, 256, 3, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream); break;
++                }
++            }
++            return true;
++        }
++        if (bpr > 128 && bpr <= 160 && !has_gate) {
++            // K = 17408 (136 blocks): 8 rows per CTA keeps 6 CTAs/SM (64 regs, 8.7 KB smem); 16 rows per CTA halved
++            // the occupancy and was 2.5x slower (P104: 101 us vs 251 us for 5120 x 17408), 32 rows worse still
++            switch (cfg) {
++                case 2:  mul_mat_vec_ptq1_0_ks_launch<1, 16, 2, 160, 4, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream); break;
++                default: mul_mat_vec_ptq1_0_ks_launch<1,  8, 2, 160, 6, false>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, false, stream); break;
++            }
++            return true;
++        }
++        return false;
++    }
+     if (bpr > 32 && bpr < 64) {
+         if (has_gate) {
+             mul_mat_vec_ptq1_0_ks_launch<4, 1, 1, 256, 4, true>(vx, vy, fusion, dst, ncols_x, nrows_x, stride_row_x, true, stream);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 621267844..f92dc264c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12413,6 +12413,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+     }
+ 
++    // optB: Bonsai 2 27B PTQ1_0 projection shapes (m = rows, k = K). n = 1 covers the K-block-stationary
++    // one-column kernel (nrows >= 4096, K = 40/48/136 blocks), n = 2..8 the planar multi-column kernel,
++    // n = 9/32/512 the MMQ dp4a tile kernel on Pascal.
++    for (int n : {1, 2, 4, 8, 9, 32, 512}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  5120, n,  5120, { 1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  5120, n, 17408, { 1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  5120, n,  6144, { 1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 17408, n,  5120, { 1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,  1024, n,  5120, { 1, 1}, {1, 1}));
++    }
++
+     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
+     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+         for (int n = 1; n <= 8; ++n) {
+@@ -14142,6 +14153,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // optB: Bonsai 2 27B PTQ1_0 shapes, decode (n = 1) and prefill (n = 512); PQ2_0 as the control
++    for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0}) {
++        for (int n : {1, 512}) {
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n,  5120, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, n,  5120, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n, 17408, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, n,  6144, { 1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 10240, n,  5120, { 1, 1}, {1, 1}));
++        }
++    }
++
+     // ARC-LAB: Bonsai 2 GDN layer shape (16 k-heads x 128, 48 v-heads): prompt batch and decode
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3));

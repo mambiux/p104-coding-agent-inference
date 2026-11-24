@@ -1,0 +1,127 @@
+--- /home/mbx/CORE/llama/prism-pascal-best/src/tools/server/server-context.cpp	2026-11-23 21:10:53.210838584 +0100
++++ src/tools/server/server-context.cpp	2026-11-24 05:49:31.363904232 +0100
+@@ -293,6 +293,9 @@
+     common_speculative * spec;
+     int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)
+ 
++    double spec_t_save_ms  = 0.0; // prism-pascal-rs: last speculative target checkpoint save (LLAMA_SPEC_TIMING)
++    size_t spec_save_bytes = 0;   // host bytes of that checkpoint (metadata only with the device plane)
++
+     llama_tokens spec_draft;
+ 
+     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+@@ -1084,6 +1087,16 @@
+     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+ 
++    // prism-pascal-rs: LLAMA_SPEC_CKPT_DEVICE_PLANE=1 keeps the speculative target checkpoint (the recurrent state of
++    // the slot, one plane: conv + GDN state of every recurrent layer) in a device buffer owned by the target context
++    // (llama_context::mem_storage[seq], LLAMA_STATE_SEQ_FLAGS_ON_DEVICE): save and restore are device->device copies
++    // instead of a device->host->device round trip over PCIe. LLAMA_SPEC_TIMING=1 logs the per-step cost.
++    bool   spec_timing      = false;
++    bool   spec_ckpt_plane  = false;
++    llama_state_seq_flags spec_ckpt_flags_tgt = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
++    double spec_t_decode_ms = 0.0; // last llama_process of the target
++    int    spec_n_decode    = 0;   // rows of that batch
++
+     common_speculative_ptr spec;
+ 
+     bool add_bos_token = true;
+@@ -1296,6 +1309,17 @@
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        {
++            const char * e_t = getenv("LLAMA_SPEC_TIMING");
++            const char * e_p = getenv("LLAMA_SPEC_CKPT_DEVICE_PLANE");
++            spec_timing     = e_t != nullptr && atoi(e_t) != 0;
++            spec_ckpt_plane = e_p != nullptr && atoi(e_p) != 0;
++            if (spec_ckpt_plane) {
++                spec_ckpt_flags_tgt |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
++                SRV_INF("%s", "LLAMA_SPEC_CKPT_DEVICE_PLANE: speculative target checkpoints stay on the device (one plane per slot)\n");
++            }
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
+         model_tgt = llama_init->model();
+@@ -3887,12 +3911,12 @@
+                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
+ 
+                 if (use_ckpt_tgt) {
+-                    //const int64_t t_start = ggml_time_us();
++                    const int64_t t_start = ggml_time_us();
+ 
+-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    ckpt.update_tgt(ctx_tgt, slot.id, spec_ckpt_flags_tgt);
+ 
+-                    //const int64_t t_total = ggml_time_us() - t_start;
+-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
++                    slot.spec_t_save_ms  = (ggml_time_us() - t_start) / 1000.0;
++                    slot.spec_save_bytes = ckpt.data_tgt.size();
+ 
+                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
+                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
+@@ -4635,10 +4659,13 @@
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
++            const int64_t t_dec0 = ggml_time_us();
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
++            spec_t_decode_ms = (ggml_time_us() - t_dec0) / 1000.0;
++            spec_n_decode    = batch.view.size();
+         });
+ 
+         if (ret != 0) {
+@@ -4897,6 +4924,7 @@
+                 // drafters that fill no distribution fall back here
+                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+ 
++                const int64_t t_smp0 = ggml_time_us();
+                 std::vector<llama_token> accepted;
+                 if (!synth_probs.empty()) {
+                     // synthetic acceptance replaces verification entirely, so it comes first
+@@ -4912,9 +4940,18 @@
+                 }
+ 
+                 GGML_ASSERT(accepted.size() >= 1);
++                const double t_smp_ms = (ggml_time_us() - t_smp0) / 1000.0;
+ 
+                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+ 
++                if (spec_timing) {
++                    SLT_INF(slot, "spec-timing: draft=%zu accepted=%zu replay=%d | ckpt_save %.2f ms (%.3f MiB host%s) | decode %d rows %.1f ms | sample %.1f ms | rollback=%u\n",
++                            n_draft, accepted.size() - 1, (int) slot.spec_is_replay,
++                            slot.spec_t_save_ms, slot.spec_save_bytes / 1048576.0, spec_ckpt_plane ? ", device plane" : "",
++                            spec_n_decode, spec_t_decode_ms, t_smp_ms, n_rollback);
++                    slot.spec_t_save_ms = 0.0; slot.spec_save_bytes = 0;
++                }
++
+                 const bool use_ckpt_tgt =
+                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+@@ -4934,13 +4971,20 @@
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
+-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++                        const int64_t t_rst0 = ggml_time_us();
++                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, spec_ckpt_flags_tgt));
++                        const double t_rst_tgt_ms = (ggml_time_us() - t_rst0) / 1000.0;
+ 
+                         if (slot.ctx_dft) {
+                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                         }
+ 
+                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
++                        if (spec_timing) {
++                            SLT_INF(slot, "spec-timing: restore tgt %.2f ms, total %.2f ms (%s) + replay of %zu accepted tokens follows\n",
++                                    t_rst_tgt_ms, (ggml_time_us() - t_rst0) / 1000.0, spec_ckpt_plane ? "device plane" : "host copy",
++                                    slot.spec_draft.size());
++                        }
+ 
+                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                         common_sampler_copy(smpl_save.get(), slot.smpl.get());

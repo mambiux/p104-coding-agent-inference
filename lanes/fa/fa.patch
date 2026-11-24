@@ -1,0 +1,552 @@
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -3,6 +3,7 @@
+ #include "fattn-mma-f16.cuh"
+ #include "fattn-tile.cuh"
+ #include "fattn-vec.cuh"
++#include "fattn-vec-p61.cuh"
+ #include "fattn.cuh"
+ 
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -945,6 +946,10 @@
+         ggml_cuda_flash_attn_ext_pad72(ctx, dst);
+         return;
+     }
++    if (ggml_cuda_flash_attn_ext_vec_p61_applies(ggml_cuda_info().devices[device].cc, dst)) {
++        ggml_cuda_flash_attn_ext_vec_p61(ctx, dst);
++        return;
++    }
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+--- a/ggml/src/ggml-cuda/fattn-vec-p61.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec-p61.cuh
+@@ -0,0 +1,481 @@
++// Pascal (sm_61) decode flash attention for D=256 GQA heads with quantized K (q4_0/q8_0) and V (q4_0/q8_0/f16).
++// One block works on all G query heads that share a KV head (K/V are read from DRAM once instead of G times),
++// the KV sequence is split across gridDim.x blocks (combined by flash_attn_combine_results), K*Q uses dp4a on
++// q8 Q, V dequantization uses exact integer->float magic-number tricks (no I2F/F2F per element, no fp16 math).
++// Layout per warp: 32 KV tokens per tile; QK: 8 lanes per token (one 32-wide quant block per lane), 4 tokens per pass;
++// PV: 32 lanes x 8 dims per token. Kill switch: GGML_CUDA_FA_P61=0.
++#pragma once
++
++#include "common.cuh"
++#include "fattn-common.cuh"
++
++#define FA_P61_D        256
++#define FA_P61_NWARPS   4
++#define FA_P61_NTHREADS (FA_P61_NWARPS*WARP_SIZE)
++#define FA_P61_TILE     (FA_P61_NWARPS*WARP_SIZE) // KV tokens per block iteration (32 per warp)
++#ifndef FA_P61_VUNROLL
++#define FA_P61_VUNROLL 8
++#endif
++
++
++static __device__ __forceinline__ float fa_p61_h2f(const uint32_t bits16) {
++    return __half2float(__ushort_as_half((unsigned short) bits16));
++}
++
++template <ggml_type type_K, ggml_type type_V, int G, int minb>
++__launch_bounds__(FA_P61_NTHREADS, minb)
++static __global__ void flash_attn_ext_vec_p61(
++        const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V, const char * __restrict__ mask,
++        float * __restrict__ dst, float2 * __restrict__ dst_meta,
++        const float scale, const int ne11, const int kv_per_block, const int nsplit, const int ne01, const int ne02,
++        const int nb01, const int nb02, const int nb11, const int nb12, const int nb21, const int nb22, const int nb31) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 610
++    constexpr int D = FA_P61_D;
++    static_assert(type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q8_0, "bad K type");
++    static_assert(type_V == GGML_TYPE_Q4_0 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_F16, "bad V type");
++
++    const int split = blockIdx.x;
++    const int kvh   = blockIdx.y;
++    const int tok   = blockIdx.z;
++    const int h0    = kvh*G;
++    const int warp  = threadIdx.y;
++    const int lane  = threadIdx.x;
++    const int tid   = warp*WARP_SIZE + lane;
++
++    __shared__ __align__(16) int Qq_s[G][8][8];
++    __shared__ float  Qd_s[G][8];
++    __shared__ int    Qo_s[G][8];
++    __shared__ float4 P_s[FA_P61_NWARPS][WARP_SIZE][2];
++    __shared__ float  wm_s[FA_P61_NWARPS][G];
++    __shared__ float  wl_s[FA_P61_NWARPS][G];
++    __shared__ __align__(16) float red_s[G][D];
++
++    // ---- quantize Q (G heads x 8 blocks of 32) to int8, one thread per block ----
++    if (tid < G*8) {
++        const int h = tid / 8;
++        const int s = tid % 8;
++        const float4 * qf = (const float4 *) (Q + tok*nb01 + (h0 + h)*nb02) + s*8;
++        float4 x[8];
++        float amax = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            x[i] = qf[i];
++            amax = fmaxf(amax, fmaxf(fmaxf(fabsf(x[i].x), fabsf(x[i].y)), fmaxf(fabsf(x[i].z), fabsf(x[i].w))));
++        }
++        const float d  = amax / 127.0f;
++        const float id = d > 0.0f ? 1.0f/d : 0.0f;
++        int sum = 0;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const int a = __float2int_rn(x[i].x*id);
++            const int b = __float2int_rn(x[i].y*id);
++            const int c = __float2int_rn(x[i].z*id);
++            const int e = __float2int_rn(x[i].w*id);
++            sum += a + b + c + e;
++            Qq_s[h][s][i] = (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((uint32_t) (e & 0xFF) << 24);
++        }
++        Qd_s[h][s] = d*scale;
++        // integer offset folded into the int->float magic constant 0x4B400000 (= 1.5*2^23):
++        Qo_s[h][s] = 0x4B400000 - (type_K == GGML_TYPE_Q4_0 ? 8*sum : 0);
++    }
++    __syncthreads();
++
++    const int s = lane & 7;  // quant block of the K row handled by this lane
++    const int g = lane >> 3; // token group within a pass
++
++    int   qreg[G][8];
++    float qd[G];
++    int   qo[G];
++#pragma unroll
++    for (int h = 0; h < G; ++h) {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            qreg[h][i] = Qq_s[h][s][i];
++        }
++        qd[h] = Qd_s[h][s];
++        qo[h] = Qo_s[h][s];
++    }
++
++    float acc[G][8];
++    float m[G];
++    float l[G];
++#pragma unroll
++    for (int h = 0; h < G; ++h) {
++        m[h] = -FLT_MAX/2.0f;
++        l[h] = 0.0f;
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            acc[h][e] = 0.0f;
++        }
++    }
++
++    const char * Kh = K + kvh*nb12;
++    const char * Vh = V + kvh*nb22;
++    const half * mrow = (const half *) (mask + tok*nb31);
++
++    constexpr int K_bs  = type_K == GGML_TYPE_Q4_0 ? 18 : 34; // block bytes
++    constexpr int K_nw  = type_K == GGML_TYPE_Q4_0 ? 5 : 9;   // aligned words covering one block
++    const int K_off     = (s*K_bs) & ~3;
++    const uint32_t K_sel = (s & 1) ? 0x7654 : 0x5432;
++    const int K_dsh     = (s & 1) ? 16 : 0;
++
++    // V lane geometry
++    const int vb  = lane >> 2; // quant block of the V row
++    const int vi4 = lane & 3;
++    int V_off_q = 0, V_off_d = 0, V_dsh = 0;
++    bool V_mis = false;
++    if (type_V == GGML_TYPE_Q4_0) {
++        const int off = vb*18 + 2 + 4*vi4;
++        V_off_q = off & ~3; V_mis = (off & 2) != 0;
++        V_off_d = (vb*18) & ~3; V_dsh = (vb & 1) ? 16 : 0;
++    } else if (type_V == GGML_TYPE_Q8_0) {
++        const int off = vb*34 + 2 + 8*vi4;
++        V_off_q = off & ~3; V_mis = (off & 2) != 0;
++        V_off_d = (vb*34) & ~3; V_dsh = (vb & 1) ? 16 : 0;
++    } else {
++        V_off_q = 16*lane;
++    }
++
++    const int nb11_4 = 4*nb11;
++    constexpr int vunroll = FA_P61_VUNROLL;
++    const int k_beg = split*kv_per_block;
++    const int k_end = min(k_beg + kv_per_block, ne11);
++
++    for (int t0 = k_beg + warp*WARP_SIZE; t0 < k_end; t0 += FA_P61_TILE) {
++        // ---------------- K*Q ----------------
++        float sc[G];
++        const char * kp = Kh + (int64_t) (t0 + g)*nb11 + K_off;
++#pragma unroll
++        for (int p = 0; p < 8; ++p) {
++            const uint32_t * kw = (const uint32_t *) (kp + p*nb11_4);
++            uint32_t w[K_nw];
++#pragma unroll
++            for (int i = 0; i < K_nw; ++i) {
++                w[i] = __ldg(kw + i);
++            }
++            const float dk = fa_p61_h2f(w[0] >> K_dsh);
++            int sumi[G];
++#pragma unroll
++            for (int h = 0; h < G; ++h) {
++                sumi[h] = qo[h];
++            }
++            if (type_K == GGML_TYPE_Q4_0) {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    const uint32_t q  = __byte_perm(w[i], w[i+1], K_sel);
++                    const int      lo = q & 0x0F0F0F0F;
++                    const int      hi = (q >> 4) & 0x0F0F0F0F;
++#pragma unroll
++                    for (int h = 0; h < G; ++h) {
++                        sumi[h] = __dp4a(lo, qreg[h][i],   sumi[h]);
++                        sumi[h] = __dp4a(hi, qreg[h][4+i], sumi[h]);
++                    }
++                }
++            } else {
++#pragma unroll
++                for (int i = 0; i < 8; ++i) {
++                    const int q = __byte_perm(w[i], w[i+1], K_sel);
++#pragma unroll
++                    for (int h = 0; h < G; ++h) {
++                        sumi[h] = __dp4a(q, qreg[h][i], sumi[h]);
++                    }
++                }
++            }
++#pragma unroll
++            for (int h = 0; h < G; ++h) {
++                float v = (__int_as_float(sumi[h]) - 12582912.0f) * (dk*qd[h]);
++                v += __shfl_xor_sync(0xFFFFFFFF, v, 1);
++                v += __shfl_xor_sync(0xFFFFFFFF, v, 2);
++                v += __shfl_xor_sync(0xFFFFFFFF, v, 4);
++                if (s == p) {
++                    sc[h] = v;
++                }
++            }
++        }
++        // this lane now holds the scores of token t0 + 4*s + g
++        const float mk = __half2float(mrow[t0 + 4*s + g]);
++
++        float pr[G];
++#pragma unroll
++        for (int h = 0; h < G; ++h) {
++            const float x = sc[h] + mk;
++            const float mx = warp_reduce_max(x);
++            const float mnew = fmaxf(m[h], mx + FATTN_KQ_MAX_OFFSET);
++            const float alpha = __expf(m[h] - mnew);
++            m[h] = mnew;
++            pr[h] = __expf(x - mnew);
++            l[h] = l[h]*alpha + pr[h];
++#pragma unroll
++            for (int e = 0; e < 8; ++e) {
++                acc[h][e] *= alpha;
++            }
++        }
++        P_s[warp][lane][0] = make_float4(pr[0], G > 1 ? pr[1 % G] : 0.0f, G > 2 ? pr[2 % G] : 0.0f, G > 3 ? pr[3 % G] : 0.0f);
++        P_s[warp][lane][1] = make_float4(G > 4 ? pr[4 % G] : 0.0f, G > 5 ? pr[5 % G] : 0.0f, G > 6 ? pr[6 % G] : 0.0f, G > 7 ? pr[7 % G] : 0.0f);
++        __syncwarp();
++
++        // ---------------- P*V ----------------
++        const char * vrow0 = Vh + (int64_t) t0*nb21;
++#pragma unroll vunroll
++        for (int j = 0; j < WARP_SIZE; ++j) {
++            // token t0 + j is held by lane (j%4)*8 + j/4
++            const float4 pa = P_s[warp][(j & 3)*8 + (j >> 2)][0];
++            const float4 pb = P_s[warp][(j & 3)*8 + (j >> 2)][1];
++            float p8[8] = {pa.x, pa.y, pa.z, pa.w, pb.x, pb.y, pb.z, pb.w};
++            const char * vrow = vrow0 + j*nb21;
++            float v[8];
++            if (type_V == GGML_TYPE_Q4_0) {
++                const uint32_t * vw = (const uint32_t *) (vrow + V_off_q);
++                const uint32_t w0 = __ldg(vw);
++                const uint32_t w1 = V_mis ? __ldg(vw + 1) : 0u;
++                const uint32_t q  = __byte_perm(w0, w1, V_mis ? 0x5432 : 0x3210);
++                const float d = fa_p61_h2f(__ldg((const uint32_t *) (vrow + V_off_d)) >> V_dsh);
++#pragma unroll
++                for (int h = 0; h < G; ++h) p8[h] *= d;
++                const uint32_t q2 = q >> 20;
++                // nibble k of q -> element (k even: k/2, k odd: 4 + k/2)
++                v[0] = fmaf(__uint_as_float((q  & 0x0000000Fu) | 0x4B000000u), 1.0f,          -(8388608.0f            + 8.0f));
++                v[4] = fmaf(__uint_as_float((q  & 0x000000F0u) | 0x4B000000u), 1.0f/16.0f,    -(8388608.0f/16.0f      + 8.0f));
++                v[1] = fmaf(__uint_as_float((q  & 0x00000F00u) | 0x4B000000u), 1.0f/256.0f,   -(8388608.0f/256.0f     + 8.0f));
++                v[5] = fmaf(__uint_as_float((q  & 0x0000F000u) | 0x4B000000u), 1.0f/4096.0f,  -(8388608.0f/4096.0f    + 8.0f));
++                v[2] = fmaf(__uint_as_float((q  & 0x000F0000u) | 0x4B000000u), 1.0f/65536.0f, -(8388608.0f/65536.0f   + 8.0f));
++                v[6] = fmaf(__uint_as_float((q2 & 0x0000000Fu) | 0x4B000000u), 1.0f,          -(8388608.0f            + 8.0f));
++                v[3] = fmaf(__uint_as_float((q2 & 0x000000F0u) | 0x4B000000u), 1.0f/16.0f,    -(8388608.0f/16.0f      + 8.0f));
++                v[7] = fmaf(__uint_as_float((q2 & 0x00000F00u) | 0x4B000000u), 1.0f/256.0f,   -(8388608.0f/256.0f     + 8.0f));
++            } else if (type_V == GGML_TYPE_Q8_0) {
++                const uint32_t * vw = (const uint32_t *) (vrow + V_off_q);
++                const uint32_t w0 = __ldg(vw);
++                const uint32_t w1 = __ldg(vw + 1);
++                const uint32_t w2 = V_mis ? __ldg(vw + 2) : 0u;
++                const uint32_t sel = V_mis ? 0x5432 : 0x3210;
++                const uint32_t qa = __byte_perm(w0, w1, sel) ^ 0x80808080u;
++                const uint32_t qb = __byte_perm(w1, w2, sel) ^ 0x80808080u;
++                const float d = fa_p61_h2f(__ldg((const uint32_t *) (vrow + V_off_d)) >> V_dsh);
++#pragma unroll
++                for (int h = 0; h < G; ++h) p8[h] *= d;
++                v[0] = fmaf(__uint_as_float((qa & 0x000000FFu) | 0x4B000000u), 1.0f,         -(8388608.0f         + 128.0f));
++                v[1] = fmaf(__uint_as_float((qa & 0x0000FF00u) | 0x4B000000u), 1.0f/256.0f,  -(8388608.0f/256.0f  + 128.0f));
++                const uint32_t qa2 = qa >> 16;
++                v[2] =      __uint_as_float((qa2 & 0x000000FFu) | 0x4B000000u)               -(8388608.0f         + 128.0f);
++                v[3] = fmaf(__uint_as_float((qa2 & 0x0000FF00u) | 0x4B000000u), 1.0f/256.0f, -(8388608.0f/256.0f  + 128.0f));
++                v[4] = fmaf(__uint_as_float((qb & 0x000000FFu) | 0x4B000000u), 1.0f,         -(8388608.0f         + 128.0f));
++                v[5] = fmaf(__uint_as_float((qb & 0x0000FF00u) | 0x4B000000u), 1.0f/256.0f,  -(8388608.0f/256.0f  + 128.0f));
++                const uint32_t qb2 = qb >> 16;
++                v[6] =      __uint_as_float((qb2 & 0x000000FFu) | 0x4B000000u)               -(8388608.0f         + 128.0f);
++                v[7] = fmaf(__uint_as_float((qb2 & 0x0000FF00u) | 0x4B000000u), 1.0f/256.0f, -(8388608.0f/256.0f  + 128.0f));
++            } else {
++                const uint4 raw = __ldg((const uint4 *) (vrow + V_off_q));
++                const uint32_t r[4] = {raw.x, raw.y, raw.z, raw.w};
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    const float2 f = __half22float2(*(const half2 *) &r[j]);
++                    v[2*j] = f.x; v[2*j+1] = f.y;
++                }
++            }
++#pragma unroll
++            for (int h = 0; h < G; ++h) {
++#pragma unroll
++                for (int e = 0; e < 8; ++e) {
++                    acc[h][e] = fmaf(p8[h], v[e], acc[h][e]);
++                }
++            }
++        }
++        __syncwarp();
++    }
++
++    // ---------------- combine the 4 warps ----------------
++#pragma unroll
++    for (int h = 0; h < G; ++h) {
++        l[h] = warp_reduce_sum(l[h]);
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int h = 0; h < G; ++h) {
++            wm_s[warp][h] = m[h];
++            wl_s[warp][h] = l[h];
++        }
++    }
++    __syncthreads();
++    float fw[G];
++#pragma unroll
++    for (int h = 0; h < G; ++h) {
++        float M = wm_s[0][h];
++#pragma unroll
++        for (int w = 1; w < FA_P61_NWARPS; ++w) {
++            M = fmaxf(M, wm_s[w][h]);
++        }
++        fw[h] = __expf(m[h] - M);
++    }
++    // output dims of this lane's 8 accumulators
++    int dim0, dim1; // two runs of 4 consecutive dims
++    if (type_V == GGML_TYPE_Q4_0) {
++        dim0 = 32*vb + 4*vi4; dim1 = dim0 + 16;
++    } else {
++        dim0 = 8*lane; dim1 = dim0 + 4;
++    }
++#pragma unroll
++    for (int w = 0; w < FA_P61_NWARPS; ++w) {
++        if (warp == w) {
++#pragma unroll
++            for (int h = 0; h < G; ++h) {
++                float4 a = make_float4(acc[h][0]*fw[h], acc[h][1]*fw[h], acc[h][2]*fw[h], acc[h][3]*fw[h]);
++                float4 b = make_float4(acc[h][4]*fw[h], acc[h][5]*fw[h], acc[h][6]*fw[h], acc[h][7]*fw[h]);
++                if (w > 0) {
++                    const float4 a0 = *(float4 *) &red_s[h][dim0];
++                    const float4 b0 = *(float4 *) &red_s[h][dim1];
++                    a.x += a0.x; a.y += a0.y; a.z += a0.z; a.w += a0.w;
++                    b.x += b0.x; b.y += b0.y; b.z += b0.z; b.w += b0.w;
++                }
++                *(float4 *) &red_s[h][dim0] = a;
++                *(float4 *) &red_s[h][dim1] = b;
++            }
++        }
++        __syncthreads();
++    }
++
++    for (int idx = tid; idx < G*D; idx += FA_P61_NTHREADS) {
++        const int h = idx / D;
++        const int i = idx % D;
++        float M = wm_s[0][h];
++#pragma unroll
++        for (int w = 1; w < FA_P61_NWARPS; ++w) {
++            M = fmaxf(M, wm_s[w][h]);
++        }
++        float L = 0.0f;
++#pragma unroll
++        for (int w = 0; w < FA_P61_NWARPS; ++w) {
++            L += wl_s[w][h]*__expf(wm_s[w][h] - M);
++        }
++        const int j = tok*ne02 + h0 + h; // permuted dst row
++        if (nsplit == 1) {
++            dst[(int64_t) j*D + i] = red_s[h][i] / L;
++        } else {
++            dst[((int64_t) j*nsplit + split)*D + i] = red_s[h][i];
++            if (i == 0) {
++                dst_meta[j*nsplit + split] = make_float2(M, L);
++            }
++        }
++    }
++#else
++    GGML_UNUSED_VARS(Q, K, V, mask, dst, dst_meta, scale, ne11, kv_per_block, nsplit, ne01, ne02, nb01, nb02, nb11, nb12, nb21, nb22, nb31);
++    NO_DEVICE_CODE;
++#endif
++}
++
++template <ggml_type type_K, ggml_type type_V, int G, int minb>
++static void ggml_cuda_flash_attn_ext_vec_p61_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    float scale;
++    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
++
++    const int id  = ggml_cuda_get_device();
++    const int nsm = ggml_cuda_info().devices[id].nsm;
++    cudaStream_t stream = ctx.stream();
++
++    auto kernel = flash_attn_ext_vec_p61<type_K, type_V, G, minb>;
++    static int occ = 0;
++    if (occ == 0) {
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, FA_P61_NTHREADS, 0));
++        occ = std::max(occ, 1);
++    }
++
++    const int ne11  = K->ne[1];
++    const int nkvh  = K->ne[2];
++    const int ne01  = Q->ne[1];
++    const int ntile = ne11 / FA_P61_TILE;
++
++    static const int blocks_env = [] { const char * e = getenv("GGML_CUDA_FA_P61_BLOCKS"); return e ? atoi(e) : 0; }();
++    const int target_blocks = blocks_env > 0 ? blocks_env : nsm*occ*2;
++    int nsplit = std::max(1, std::min(ntile, (target_blocks + nkvh*ne01 - 1) / (nkvh*ne01)));
++    const int tiles_per_block = (ntile + nsplit - 1) / nsplit;
++    nsplit = (ntile + tiles_per_block - 1) / tiles_per_block;
++    const int kv_per_block = tiles_per_block*FA_P61_TILE;
++
++    ggml_cuda_pool_alloc<float>  dst_tmp(ctx.pool());
++    ggml_cuda_pool_alloc<float2> dst_meta(ctx.pool());
++    if (nsplit > 1) {
++        dst_tmp.alloc((size_t) nsplit*ggml_nelements(dst));
++        dst_meta.alloc((size_t) nsplit*ggml_nrows(dst));
++    }
++
++    const dim3 grid(nsplit, nkvh, ne01);
++    const dim3 block(WARP_SIZE, FA_P61_NWARPS, 1);
++    kernel<<<grid, block, 0, stream>>>(
++        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
++        nsplit > 1 ? dst_tmp.ptr : (float *) dst->data, dst_meta.ptr,
++        scale, ne11, kv_per_block, nsplit, ne01, Q->ne[2],
++        Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
++    CUDA_CHECK(cudaGetLastError());
++
++    if (nsplit > 1) {
++        const dim3 grid_c(ne01, Q->ne[2], 1);
++        flash_attn_combine_results<FA_P61_D><<<grid_c, FA_P61_D, nsplit*sizeof(float2), stream>>>(
++            dst_tmp.ptr, dst_meta.ptr, (float *) dst->data, nsplit);
++        CUDA_CHECK(cudaGetLastError());
++    }
++}
++
++static bool ggml_cuda_flash_attn_ext_vec_p61_applies(const int cc, const ggml_tensor * dst) {
++    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_FA_P61"); return e == nullptr || atoi(e) != 0; }();
++    if (!enabled || cc != 610) {
++        return false;
++    }
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++    float max_bias, logit_softcap;
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    if (Q->ne[0] != FA_P61_D || K->ne[0] != FA_P61_D || V->ne[0] != FA_P61_D) return false;
++    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) return false;
++    if (V->type != GGML_TYPE_Q4_0 && V->type != GGML_TYPE_Q8_0 && V->type != GGML_TYPE_F16) return false;
++    if (!mask || sinks || max_bias != 0.0f || logit_softcap != 0.0f) return false;
++    if (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) return false;
++    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) return false;
++    // GGML_CUDA_FA_P61_MIN_KV:       min. KV length for single-token decode (default 0)
++    // GGML_CUDA_FA_P61_MIN_KV_MULTI: min. KV length for 2..4 query tokens, e.g. a speculative verify batch (default 4096;
++    //                                at short KV the multi-token path lowered MTP acceptance in serving, see fa.patch notes)
++    // GGML_CUDA_FA_P61_MAX_NQ:       max. number of query tokens handled (1..4, default 4)
++    // Below the thresholds the stock kernels are used.
++    static const int min_kv       = [] { const char * e = getenv("GGML_CUDA_FA_P61_MIN_KV");       return e ? atoi(e) : 0;    }();
++    static const int min_kv_multi = [] { const char * e = getenv("GGML_CUDA_FA_P61_MIN_KV_MULTI"); return e ? atoi(e) : 4096; }();
++    static const int max_nq = [] { const char * e = getenv("GGML_CUDA_FA_P61_MAX_NQ"); return e ? std::max(1, std::min(4, atoi(e))) : 4; }();
++    if (Q->ne[1] < 1 || Q->ne[1] > max_nq) return false;
++    if (K->ne[1] < (Q->ne[1] == 1 ? min_kv : min_kv_multi)) return false;
++    if (K->ne[2] != V->ne[2] || Q->ne[2] != 6*K->ne[2]) return false; // G = 6 instantiated
++    if (K->ne[1] % FA_P61_TILE != 0 || V->ne[1] != K->ne[1]) return false;
++    if (Q->nb[1] % 16 || Q->nb[2] % 16 || (uintptr_t) Q->data % 16) return false;
++    if (K->nb[1] % 4 || K->nb[2] % 4 || (uintptr_t) K->data % 4) return false;
++    const int v_align = V->type == GGML_TYPE_F16 ? 16 : 4;
++    if (V->nb[1] % v_align || V->nb[2] % v_align || (uintptr_t) V->data % v_align) return false;
++    if (mask->nb[1] % 2 || mask->ne[0] < K->ne[1]) return false;
++    // dst is the permuted, contiguous [D, n_head, n_tokens] layout written by all FA kernels
++    if (!ggml_is_contiguous(dst)) return false;
++    // int32 offsets
++    if ((int64_t) K->ne[1]*K->nb[1] > INT_MAX || (int64_t) V->ne[1]*V->nb[1] > INT_MAX) return false;
++    return true;
++}
++
++static void ggml_cuda_flash_attn_ext_vec_p61(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_type tK = dst->src[1]->type;
++    const ggml_type tV = dst->src[2]->type;
++    static const int minb = [] { const char * e = getenv("GGML_CUDA_FA_P61_MINB"); return e ? atoi(e) : 2; }();
++#define FA_P61_CASE(TK, TV) if (tK == TK && tV == TV) { \
++        if (minb == 3) { ggml_cuda_flash_attn_ext_vec_p61_case<TK, TV, 6, 3>(ctx, dst); } \
++        else           { ggml_cuda_flash_attn_ext_vec_p61_case<TK, TV, 6, 2>(ctx, dst); } return; }
++    FA_P61_CASE(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
++    FA_P61_CASE(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0)
++    FA_P61_CASE(GGML_TYPE_Q4_0, GGML_TYPE_F16)
++    FA_P61_CASE(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
++    FA_P61_CASE(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
++    FA_P61_CASE(GGML_TYPE_Q8_0, GGML_TYPE_F16)
++#undef FA_P61_CASE
++    GGML_ABORT("fatal error");
++}
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11165,6 +11165,19 @@
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    // P61-FA: Bonsai 2 27B full-attention shape, KV cache layout; decode and small batches
++    for (auto t : std::vector<std::pair<ggml_type, ggml_type>>{
++            {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0},
++            {GGML_TYPE_Q4_0, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_F16}, {GGML_TYPE_F16, GGML_TYPE_F16}}) {
++        for (int64_t kv : {256, 512, 1024, 4096, 8192}) {
++            for (int64_t nb : {1, 2, 3}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t.first, t.second, {0, 2, 1, 3}));
++            }
++        }
++        test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 4, {6, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, t.first, t.second, {0, 2, 1, 3}));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, t.first, t.second));
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -14142,6 +14155,24 @@
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // P61-FA: Bonsai 2 27B full-attention shape (24 q heads, 4 kv heads, D=256), KV cache layout (heads interleaved per token)
++    if (getenv("FA_P61_PERF")) {
++        auto parse = [](const char * e, std::vector<int64_t> def) {
++            if (!e) return def;
++            std::vector<int64_t> r; char * c = (char *) e;
++            while (*c) { r.push_back(strtoll(c, &c, 10)); if (*c == ',') c++; }
++            return r;
++        };
++        const std::vector<int64_t> kvs = parse(getenv("FA_P61_KV"), {4096, 16384, 32768, 49152, 61440});
++        const std::vector<int64_t> nbs = parse(getenv("FA_P61_NB"), {1});
++        const std::vector<std::pair<ggml_type, ggml_type>> kvt = {
++            {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}};
++        for (auto t : kvt) for (int64_t nb : nbs) for (int64_t kv : kvs) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t.first, t.second, {0, 2, 1, 3}));
++        }
++        return test_cases;
++    }
++
+     // ARC-LAB: Bonsai 2 GDN layer shape (16 k-heads x 128, 48 v-heads): prompt batch and decode
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 3));

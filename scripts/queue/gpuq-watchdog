@@ -1,0 +1,24 @@
+#!/bin/bash
+# kills any process using the P104 that is not part of the current gpuq job
+Q=/home/mbx/longshot/tune/queue
+while true; do
+  cur=$(cat $Q/current.pid 2>/dev/null)
+  allowed=""; [ -n "$cur" ] && allowed=$(python3 - "$cur" <<'PY'
+import os,sys
+root=sys.argv[1]; kids={}
+for p in os.listdir('/proc'):
+    if p.isdigit():
+        try: pp=open(f'/proc/{p}/stat').read().split(') ')[1].split()[1]
+        except Exception: continue
+        kids.setdefault(pp,[]).append(p)
+out=[];st=[root]
+while st:
+    x=st.pop(); out.append(x); st+=kids.get(x,[])
+print(' '.join(out))
+PY
+)
+  for pid in $(nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader 2>/dev/null | grep "GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81" | cut -d, -f1); do
+    case " $allowed " in *" $pid "*) ;; *) echo "[$(date +%T)] KILL $pid $(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | cut -c1-120)" >> $Q/killed.log; kill $pid 2>/dev/null;; esac
+  done
+  sleep 10
+done

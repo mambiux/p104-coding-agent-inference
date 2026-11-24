@@ -1,0 +1,360 @@
+--- a/ggml/src/ggml-cuda/mmq.cu	2026-11-23 21:19:40.166057900 +0100
++++ b/ggml/src/ggml-cuda/mmq.cu	2026-11-24 05:59:44.869608528 +0100
+@@ -2,6 +2,10 @@
+ #include "mmq.cuh"
+ #include "quantize.cuh"
+ #include "mmid.cuh"
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#define PTQ1_P61_HOST
++#include "mmq-ptq1-p61.cuh" // sm_61: ternary tile kernel (64/128 x 128) for PTQ1_0 prefill
++#endif
+ 
+ #include <cstdint>
+ #include <cstdlib>
+@@ -19,6 +23,12 @@
+             break;
+ #if !defined(GGML_USE_HIP)
+         case GGML_TYPE_PTQ1_0:
++#if !defined(GGML_USE_MUSA)
++            if (ggml_cuda_ptq1_p61_mmq_use(args, ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++                ggml_cuda_ptq1_p61_mmq(args, stream);
++                break;
++            }
++#endif
+             mul_mat_q_case<GGML_TYPE_PTQ1_0, GGML_PREC_Q8>(ctx, args, stream);
+             break;
+ #endif
+--- a/tests/test-backend-ops.cpp	2026-11-23 21:10:53.196183510 +0100
++++ b/tests/test-backend-ops.cpp	2026-11-24 12:31:19.341300095 +0100
+@@ -12629,6 +12629,15 @@
+         }
+     }
+ 
++    // PTQ1_0 prefill GEMM (sm_61 ternary tile kernel): full and partial 128x128 tiles, row tails, long K
++    for (int n : {9, 64, 100, 127, 128, 200, 250, 480, 512}) {
++        for (int m : {128, 1000, 1024}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 256, n, 17408, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 200, n, 640, {2, 1}, {1, 1}));
++    }
++
+     // BF16 is absent from base_types: add the 3 standard non-contig permutations explicitly
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 2, 1, 3}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  1, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
+@@ -14163,6 +14172,15 @@
+     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
+     }
++    // PTQ1_0 batched GEMMs at the Bonsai-2 27B projection shapes (m = rows, k = K): sm_61 tile vs generic MMQ crossover
++    for (int n : {5, 8, 16, 32, 48, 64, 96, 128, 192, 256, 512}) {
++        for (auto mk : std::vector<std::pair<int, int>>{{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++    for (int n : {16, 48, 128, 256, 512}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 248320, n, 5120, {1, 1}, {1, 1}));
++    }
+     // batched decode (several sequences per step) through the mat-vec path
+     for (ggml_type t : {GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0, GGML_TYPE_Q4_0}) {
+         for (int n : {2, 3, 4, 8}) {
+--- /dev/null	2026-11-23 16:20:10.927786271 +0100
++++ b/ggml/src/ggml-cuda/mmq-ptq1-p61.cuh	2026-11-24 12:31:12.647486337 +0100
+@@ -0,0 +1,297 @@
++// PTQ1_0 x Q8_1 batched mat-mul (prefill) for sm_61 (P104/P40/GTX10xx): ternary-specific dp4a tile kernel.
++//
++// CTA = 256 threads, output tile 16*RI rows (x) x 128 columns (y), K step = one PTQ1_0 block (128 values).
++// RI = 4 (default): 64-row tile, 27 KB smem, 127 regs, 2 CTAs/SM; RI = 8: 128-row tile, 36 KB, 1 CTA/SM.
++// Single smem buffer, global loads of step k+1 prefetched into registers during step k:
++//   x: 128 rows x 144 B = [fp32 d, 3 pad words, 128 signed trits as int8]     (trits unpacked ONCE per CTA tile)
++//   y: 128 cols x 144 B = block_q8_1_mmq copied verbatim (4 fp32 scales + 128 int8)
++// 144 B = 9 x 16 B (odd) rows -> conflict-free 128-bit LDS for 8 distinct rows/cols per quarter-warp.
++// Each thread owns RI rows x 8 columns: per 32-value sub-block it holds the 8 rows' 32 trits (16 LDS.128),
++// streams 8 columns (2 LDS.128 + 1 LDS each) and runs RI independent dp4a chains of 8.
++// The 4 sub-blocks are NOT unrolled: fully unrolled (~5k SASS instructions) the kernel ran 2.4x slower on sm_61
++// (instruction-cache bound: 4.3 vs 10.5 TOPS at RI=8).
++// Trit decode ("H-trick"): for a byte b and H_s = floor(b*3^s/256), digit_n = H_{n+1} - 3*H_n; computed on 4 bytes
++// at once in two 16-bit-lane words (b*3^5 < 2^16), the 32-bit difference is exact without masks because every
++// byte of the result lies in {0,1,2}. digit -> trit (-1,0,1) per byte: (D + 0x7F7F7F7F) ^ 0x80808080 (carry-free).
++// Numerics: same products as the generic MMQ (int dot per 32 values, then d_x*d_y*float(sum) accumulated in fp32),
++// only the summation order of the fp32 accumulation differs.
++#pragma once
++
++#include "common.cuh"
++
++#define PTQ1_P61_J      128
++#define PTQ1_P61_ROW    36   // ints per smem row (144 B)
++#define PTQ1_P61_NT     256
++
++static __device__ __forceinline__ uint32_t ptq1_p61_x3(uint32_t v) {
++    uint32_t r;
++    asm("add.u32 %0, %1, %1;\n\tadd.u32 %0, %0, %1;" : "=r"(r) : "r"(v)); // ptxas fuses into one IADD3
++    return r;
++}
++
++static __device__ __forceinline__ int ptq1_p61_trits(uint32_t D) {
++    return (int) ((D + 0x7F7F7F7Fu) ^ 0x80808080u);
++}
++
++// 5 trit words of one packed qs word (bytes b0..b3, digit n of every byte in word n)
++static __device__ __forceinline__ void ptq1_p61_decode5(const uint32_t W, int q[5]) {
++    uint32_t P = W & 0x00FF00FFu;          // b0, b2 in 16-bit lanes
++    uint32_t Q = (W >> 8) & 0x00FF00FFu;   // b1, b3
++    uint32_t Hp = 0;
++#pragma unroll
++    for (int n = 0; n < 5; ++n) {
++        P = ptq1_p61_x3(P);
++        Q = ptq1_p61_x3(Q);
++        const uint32_t H = __byte_perm(P, Q, 0x7351); // high bytes of the 4 lanes = H_{n+1} of b0..b3
++        q[n] = ptq1_p61_trits(H - ptq1_p61_x3(Hp));
++        Hp = H;
++    }
++}
++
++// RI = rows per thread (8: 128-row tile, 1 CTA/SM; 4: 64-row tile for small grids, 2 CTAs/SM)
++template <int RI, bool fallback>
++static __global__ void __launch_bounds__(PTQ1_P61_NT, RI == 8 ? 1 : 2) ptq1_mmq_p61(
++        const char * __restrict__ x, const int * __restrict__ y, float * __restrict__ dst,
++        const int nrows_x, const int nblocks_k, const int stride_row_x, const int ncols_y, const int ncols_dst, const int stride_col_dst) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
++    constexpr int I = 16*RI;
++    __shared__ int4 smem4[(I + PTQ1_P61_J)*PTQ1_P61_ROW/4];
++    int * xs = (int *) smem4;
++    int * ys = xs + I*PTQ1_P61_ROW;
++
++    const int tid  = threadIdx.x;
++    const int lane = tid & 31;
++    const int warp = tid >> 5;
++    const int li   = lane & 7;
++    const int lj   = lane >> 3;
++    const int wi   = warp & 1;
++    const int wj   = warp >> 1;
++
++    const int i_base = blockIdx.y*I;
++    const int j_base = blockIdx.x*PTQ1_P61_J;
++
++    // ---- loader assignment: x: 4 tasks (row, word) per thread, word 0..5 = qs, 6 = qh+d, 7 idle; y: 4.5 int4 per thread
++    const int lw = tid & 7;
++    constexpr int NXT = I/32; // x loader tasks per thread
++    const int * xrow[NXT];
++#pragma unroll
++    for (int t = 0; t < NXT; ++t) {
++        int row = t*32 + (tid >> 3);
++        int grow = i_base + row;
++        if (fallback) {
++            grow = min(grow, nrows_x - 1);
++        }
++        xrow[t] = (const int *) (x + (size_t) grow*stride_row_x*28) + (lw < 7 ? lw : 6);
++    }
++    const int4 * ybase = (const int4 *) y + (size_t) j_base*9;
++    const int ncols_tile = min(PTQ1_P61_J, ncols_dst - j_base);
++
++    uint32_t xw[NXT];
++    int4     yv[5];
++
++    auto load_global = [&](const int kb) {
++#pragma unroll
++        for (int t = 0; t < NXT; ++t) {
++            xw[t] = __ldg(xrow[t] + kb*7);
++        }
++        const int4 * yb = ybase + (size_t) kb*ncols_y*9;
++#pragma unroll
++        for (int t = 0; t < 5; ++t) {
++            const int c = tid + t*PTQ1_P61_NT;
++            if (c < PTQ1_P61_J*9 && c/9 < ncols_tile) {
++                yv[t] = __ldg(yb + c);
++            } else {
++                yv[t] = make_int4(0, 0, 0, 0);
++            }
++        }
++    };
++
++    auto store_shared = [&]() {
++#pragma unroll
++        for (int t = 0; t < NXT; ++t) {
++            const int row = t*32 + (tid >> 3);
++            int * dr = xs + row*PTQ1_P61_ROW + 4;
++            if (lw < 6) {
++                int q[5];
++                ptq1_p61_decode5(xw[t], q);
++                const int base = lw < 4 ? lw : 16 + lw;   // stage 16: n*4 + w, stage 8: 20 + 2n + (w-4)
++                const int step = lw < 4 ? 4 : 2;
++#pragma unroll
++                for (int n = 0; n < 5; ++n) {
++                    dr[base + n*step] = q[n];
++                }
++            } else if (lw == 6) {
++                // qh0, qh1 in bytes 0,1; d (fp16) in bytes 2,3. values 120 + 2n + h
++                const uint32_t W = __byte_perm(xw[t], 0, 0x1010); // qh0 qh1 qh0 qh1
++                int q[5];
++                ptq1_p61_decode5(W, q);
++                dr[30] = __byte_perm(q[0], q[1], 0x5410);
++                dr[31] = __byte_perm(q[2], q[3], 0x5410);
++                const half d = __ushort_as_half((unsigned short) (xw[t] >> 16));
++                dr[-4] = __float_as_int(__half2float(d));
++            }
++        }
++#pragma unroll
++        for (int t = 0; t < 5; ++t) {
++            const int c = tid + t*PTQ1_P61_NT;
++            if (c < PTQ1_P61_J*9) {
++                smem4[I*PTQ1_P61_ROW/4 + c] = yv[t];
++            }
++        }
++    };
++
++    float acc[RI][8];
++#pragma unroll
++    for (int r = 0; r < RI; ++r) {
++#pragma unroll
++        for (int c = 0; c < 8; ++c) {
++            acc[r][c] = 0.0f;
++        }
++    }
++
++    const int * xs_t = xs + (wi*8*RI + li)*PTQ1_P61_ROW;  // row r: + 8r*ROW
++    const int * ys_t = ys + (wj*32 + lj)*PTQ1_P61_ROW;  // col c: + 4c*ROW
++
++    load_global(0);
++
++    for (int kb = 0; kb < nblocks_k; ++kb) {
++        store_shared();
++        __syncthreads();
++        if (kb + 1 < nblocks_k) {
++            load_global(kb + 1);   // prefetch of step kb+1 into registers, overlaps the dot products of step kb
++        }
++
++        float dx[RI];
++#pragma unroll
++        for (int r = 0; r < RI; ++r) {
++            dx[r] = __int_as_float(xs_t[r*8*PTQ1_P61_ROW]);
++        }
++
++#pragma unroll 1
++        for (int b = 0; b < 4; ++b) {
++            int4 xa[RI], xb[RI];
++#pragma unroll
++            for (int r = 0; r < RI; ++r) {
++                xa[r] = *(const int4 *) (xs_t + r*8*PTQ1_P61_ROW + 4 + 8*b);
++                xb[r] = *(const int4 *) (xs_t + r*8*PTQ1_P61_ROW + 8 + 8*b);
++            }
++#pragma unroll
++            for (int c = 0; c < 8; ++c) {
++                const int4  ya = *(const int4 *) (ys_t + c*4*PTQ1_P61_ROW + 4 + 8*b);
++                const int4  yb = *(const int4 *) (ys_t + c*4*PTQ1_P61_ROW + 8 + 8*b);
++                const float dy = __int_as_float(ys_t[c*4*PTQ1_P61_ROW + b]);
++#pragma unroll
++                for (int r = 0; r < RI; ++r) {
++                    int s = __dp4a(xa[r].x, ya.x, 0);
++                    s = __dp4a(xa[r].y, ya.y, s);
++                    s = __dp4a(xa[r].z, ya.z, s);
++                    s = __dp4a(xa[r].w, ya.w, s);
++                    s = __dp4a(xb[r].x, yb.x, s);
++                    s = __dp4a(xb[r].y, yb.y, s);
++                    s = __dp4a(xb[r].z, yb.z, s);
++                    s = __dp4a(xb[r].w, yb.w, s);
++                    acc[r][c] += dx[r]*dy * (float) s;
++                }
++            }
++        }
++        __syncthreads();
++    }
++
++#pragma unroll
++    for (int c = 0; c < 8; ++c) {
++        const int j = j_base + wj*32 + lj + 4*c;
++        if (j >= ncols_dst) {
++            continue;
++        }
++#pragma unroll
++        for (int r = 0; r < RI; ++r) {
++            const int i = i_base + wi*8*RI + li + 8*r;
++            if (fallback && i >= nrows_x) {
++                continue;
++            }
++            dst[(size_t) j*stride_col_dst + i] = acc[r][c];
++        }
++    }
++#else
++    GGML_UNUSED_VARS(x, y, dst, nrows_x, nblocks_k, stride_row_x, ncols_y, ncols_dst, stride_col_dst);
++    NO_DEVICE_CODE;
++#endif
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// host side (only compiled into mmq.cu)
++#ifdef PTQ1_P61_HOST
++
++#ifndef PTQ1_P61_RI_DEFAULT
++#define PTQ1_P61_RI_DEFAULT 4 // measured 8-30 % faster than RI=8 on every Bonsai shape
++#endif
++
++static bool ggml_cuda_ptq1_p61_mmq_enabled() {
++    static const bool enabled = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_P61_MMQ");
++        return s == nullptr || atoi(s) != 0;
++    }();
++    return enabled;
++}
++
++// The tile kernel costs the same for every n in one 128-column tile and is ~10 % faster than the generic MMQ per
++// column at full tiles (measured on P104: n=128/256/512 ratio 0.90, n=64 1.67, n=96 1.04, n=192 1.21-1.27).
++// Use it for n >= GGML_CUDA_PTQ1_P61_MMQ_MIN_N (default 128) and only while the column padding of the last tile
++// stays <= 1/9 of n; everything else keeps the generic MMQ path.
++static int64_t ggml_cuda_ptq1_p61_mmq_min_n() {
++    static const int64_t v = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_P61_MMQ_MIN_N");
++        return s ? (int64_t) atoll(s) : (int64_t) 128;
++    }();
++    return v;
++}
++
++static bool ggml_cuda_ptq1_p61_mmq_n_ok(const int64_t n) {
++    const int64_t pad = (n + PTQ1_P61_J - 1)/PTQ1_P61_J*PTQ1_P61_J - n;
++    return n >= ggml_cuda_ptq1_p61_mmq_min_n() && 9*pad <= n;
++}
++
++static bool ggml_cuda_ptq1_p61_mmq_use(const mmq_args & args, const int cc) {
++    return cc == GGML_CUDA_CC_DP4A && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DP4A &&
++        ggml_cuda_ptq1_p61_mmq_enabled() && args.type_x == GGML_TYPE_PTQ1_0 &&
++        args.ids_dst == nullptr && args.expert_bounds == nullptr && args.fusion.gate == nullptr &&
++        args.nchannels_x == 1 && args.nchannels_y == 1 && args.nsamples_x == 1 && args.nsamples_y == 1 &&
++        args.ncols_x % QK_PTQ1_0 == 0 && ggml_cuda_ptq1_p61_mmq_n_ok(args.ncols_dst) &&
++        (args.nrows_x + 63)/64 <= 65535;
++}
++
++// rows per thread: 4 (64-row tiles, 2 CTAs/SM) or 8 (128-row tiles, 1 CTA/SM); GGML_CUDA_PTQ1_P61_RI overrides
++static int ggml_cuda_ptq1_p61_mmq_ri(const mmq_args & args) {
++    static const int env = [] {
++        const char * s = getenv("GGML_CUDA_PTQ1_P61_RI");
++        return s ? atoi(s) : 0;
++    }();
++    if (env == 4 || env == 8) {
++        return env;
++    }
++    GGML_UNUSED(args);
++    return PTQ1_P61_RI_DEFAULT;
++}
++
++template <int RI>
++static void ggml_cuda_ptq1_p61_mmq_launch(const mmq_args & args, cudaStream_t stream) {
++    constexpr int I = 16*RI;
++    const dim3 grid((args.ncols_dst + PTQ1_P61_J - 1)/PTQ1_P61_J, (args.nrows_x + I - 1)/I, 1);
++    const int nblocks_k = args.ncols_x / QK_PTQ1_0;
++    if (args.nrows_x % I != 0) {
++        ptq1_mmq_p61<RI, true><<<grid, PTQ1_P61_NT, 0, stream>>>(args.x, args.y, args.dst, args.nrows_x, nblocks_k,
++            args.stride_row_x, args.ncols_y, args.ncols_dst, args.nrows_dst);
++    } else {
++        ptq1_mmq_p61<RI, false><<<grid, PTQ1_P61_NT, 0, stream>>>(args.x, args.y, args.dst, args.nrows_x, nblocks_k,
++            args.stride_row_x, args.ncols_y, args.ncols_dst, args.nrows_dst);
++    }
++}
++
++static void ggml_cuda_ptq1_p61_mmq(const mmq_args & args, cudaStream_t stream) {
++    if (ggml_cuda_ptq1_p61_mmq_ri(args) == 4) {
++        ggml_cuda_ptq1_p61_mmq_launch<4>(args, stream);
++    } else {
++        ggml_cuda_ptq1_p61_mmq_launch<8>(args, stream);
++    }
++}
++#endif // PTQ1_P61_HOST

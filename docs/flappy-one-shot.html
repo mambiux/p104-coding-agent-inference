@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Flap Flight</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: pointer; -webkit-user-select: none; user-select: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  /* =========================================================
+     Flap Flight — single-file canvas game
+     All state lives inside the G namespace object.
+     ========================================================= */
+  var G = {
+    /* ---------- playfield (9:16) ---------- */
+    W: 360, H: 640, GROUND: 48,
+    FIXED: 1 / 60,
+
+    /* ---------- physics ---------- */
+    GRAV: 900,
+    FLAP: -330,
+    MAX_FALL: 620,
+
+    /* ---------- entities ---------- */
+    BIRD_X: 96,
+    BIRD_R: 15,
+    PIPE_W: 62,
+    PIPE_SPACING: 200,
+    GAP: 150,
+    SPEED: 140,
+
+    /* ---------- palette ---------- */
+    DAY: { top: [128, 204, 240], bot: [214, 244, 255], sun: [255, 224, 120],
+           hill1: [110, 190, 90], hill2: [70, 150, 70] },
+    NIGHT: { top: [10, 22, 48], bot: [26, 54, 92], sun: [222, 226, 234],
+             hill1: [46, 74, 58], hill2: [32, 54, 48] },
+    SKY: {
+      body: [255, 217, 61], wing: [255, 190, 48], beak: [255, 132, 58],
+      belly: [255, 233, 150], pipe: [82, 182, 73], pipeD: [54, 133, 49],
+      pipeCap: [104, 208, 96], pipeCapD: [70, 158, 70]
+    },
+    GROUND: { top: [245, 233, 106], fill: [229, 214, 79], dot: [214, 200, 64] },
+    WHITE: [255, 255, 255], INK: [30, 30, 40], PANEL: [255, 255, 255, 92],
+    BRONZE: [214, 154, 60], SILVER: [210, 214, 220], GOLD: [255, 205, 70],
+    MEDALS: { bronze: 10, silver: 25, gold: 50 },
+
+    /* ---------- runtime state ---------- */
+    state: "title",
+    score: 0, best: 0,
+    bird: { y: 0, vy: 0, rot: 0 },
+    wing: 0,
+    pipes: [],
+    clouds: [],
+    hills: [0, 0],
+    stars: [],
+    scroll: 0,
+    shakeT: 0,
+    flash: 0,
+    muted: false,
+    canvas: null, ctx: null, dpr: 1, scale: 1, ox: 0, oy: 0,
+    last: 0, acc: 0,
+    actx: null,
+    audioOk: false,
+    medal: null,
+
+    /* ---------- helpers ---------- */
+    lerp: function (a, b, t) { return a + (b - a) * t; },
+    lerpC: function (a, b, t) {
+      return [Math.round(this.lerp(a[0], b[0], t)),
+              Math.round(this.lerp(a[1], b[1], t)),
+              Math.round(this.lerp(a[2], b[2], t))];
+    },
+    rand: function (min, max) { return min + Math.random() * (max - min); }
+  };
+
+  G.canvas = document.getElementById("c");
+  G.ctx = G.canvas.getContext("2d");
+
+  /* ---------------- localStorage best score ---------------- */
+  function loadBest() {
+    try {
+      var v = parseInt(localStorage.getItem("flapflight-best"), 10);
+      return isNaN(v) ? 0 : v;
+    } catch (e) { return 0; }
+  }
+  function saveBest(v) {
+    try { localStorage.setItem("flapflight-best", String(v)); } catch (e) {}
+  }
+
+  /* ---------------- audio (lazy, Web Audio, graceful) ---------------- */
+  G.best = loadBest();
+
+  function audioInit() {
+    if (G.actx) { if (G.actx.state === "suspended") G.actx.resume(); return; }
+    var C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return;
+    try { G.actx = new C(); G.audioOk = true; } catch (e) {}
+  }
+  function tone(freq, dur, type, gain, slideTo) {
+    if (!G.audioOk || G.muted || !G.actx) return;
+    try {
+      var t = G.actx.currentTime;
+      var o = G.actx.createOscillator();
+      var g = G.actx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+      g.gain.setValueAtTime(gain, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(G.actx.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) {}
+  }
+  function sfxFlap()  { tone(520, 0.07, "square", 0.10, 300); }
+  function sfxScore() { tone(660, 0.09, "square", 0.10, 880); tone(880, 0.12, "square", 0.08, 1046); }
+  function sfxHit()   { tone(180, 0.25, "sawtooth", 0.16, 60); tone(90, 0.30, "square", 0.10, 40); }
+
+  /* ---------------- game logic ---------------- */
+  function difficulty() {
+    var s = G.score;
+    return {
+      speed: Math.min(140 + Math.min(s, 33) * 3.6, 260),
+      gap: Math.max(96, 150 - Math.min(s, 30) * 1.5)
+    };
+  }
+  function cycle() {
+    return 0.5 - 0.5 * Math.cos(Math.PI * ((G.score / 5) % 2)); /* smooth day<->night every 10 pts */
+  }
+
+  function resetGame() {
+    G.score = 0;
+    G.pipes = [];
+    G.bird = { y: G.H * 0.42, vy: 0, rot: 0 };
+    G.wing = 0;
+    G.scroll = 0;
+    G.shakeT = 0;
+    G.flash = 0;
+    G.medal = null;
+  }
+
+  function startGame() {
+    resetGame();
+    G.state = "playing";
+    G.acc = 0;
+  }
+
+  function die() {
+    G.state = "over";
+    var s = G.score;
+    if (s > G.best) { G.best = s; saveBest(G.best); }
+    var m = s >= 50 ? "gold" : s >= 25 ? "silver" : s >= 10 ? "bronze" : null;
+    if (m) G.medal = m;
+    sfxHit();
+    G.shakeT = 0.45;
+    G.flash = 1;
+    G.bird.vy = 0;
+  }
+
+  function spawnPipe() {
+    var d = difficulty();
+    var top = 50;
+    var bot = G.H - G.GROUND - 50 - d.gap;
+    var gapY = G.rand(top, bot);
+    var x = G.pipes.length ? G.pipes[G.pipes.length - 1].x + G.PIPE_SPACING : G.W + 90;
+    G.pipes.push({ x: x, gapY: gapY, gap: d.gap, scored: false });
+  }
+
+  function update(dt) {
+    var d = difficulty();
+    var b = G.bird;
+    b.vy = Math.min(b.vy + G.GRAV * dt, G.MAX_FALL);
+    b.y += b.vy * dt;
+    b.rot += (Math.atan2(b.vy, 150) - b.rot) * (1 - Math.exp(-12 * dt));
+    b.rot = Math.max(-0.5, Math.min(1.4, b.rot));
+    G.wing += dt * 14;
+    G.scroll += d.speed * dt;
+
+    while (G.pipes.length && G.pipes[0].x + G.PIPE_W < -20) G.pipes.shift();
+    if (G.pipes.length === 0 ||
+        G.pipes[G.pipes.length - 1].x + G.PIPE_SPACING < G.W + 4) spawnPipe();
+    for (var i = 0; i < G.pipes.length; i++) {
+      var p = G.pipes[i];
+      p.x -= d.speed * dt;
+      if (!p.scored && p.x + G.PIPE_W < G.BIRD_X) {
+        p.scored = true;
+        G.score++;
+        sfxScore();
+        G.medal = null;
+        if (G.score >= 50) G.medal = "gold";
+        else if (G.score >= 25) G.medal = "silver";
+        else if (G.score >= 10) G.medal = "bronze";
+      }
+    }
+
+    G.hills[0] = (G.hills[0] + d.speed * 0.4 * dt) % 220;
+    G.hills[1] = (G.hills[1] + d.speed * 0.75 * dt) % 160;
+    for (var j = 0; j < G.clouds.length; j++) {
+      var c = G.clouds[j];
+      c.x -= d.speed * c.speed * dt;
+      if (c.x < -c.w) { c.x = G.W + c.w; c.y = G.rand(30, G.H * 0.5); }
+    }
+
+    if (G.state === "over") {
+      b.y += b.vy * dt;
+      if (b.y > G.H - G.GROUND - G.BIRD_R) { b.y = G.H - G.GROUND - G.BIRD_R; b.vy = 0; }
+      if (G.shakeT > 0) G.shakeT -= dt;
+      if (G.flash > 0) G.flash -= dt * 3;
+      return;
+    }
+
+    if (G.shakeT > 0) G.shakeT -= dt;
+    if (G.flash > 0) G.flash -= dt * 3;
+
+    /* collisions (precise rects) */
+    if (b.y + G.BIRD_R >= G.H - G.GROUND) { die(); return; }
+    for (var k = 0; k < G.pipes.length; k++) {
+      var q = G.pipes[k];
+      if (b.y + G.BIRD_R < q.gapY - 1 || b.y - G.BIRD_R > q.gapY + q.gap / 2 + 1) continue;
+      if (b.x !== G.BIRD_X) {}
+      if (b.x !== undefined) {}
+      if (G.BIRD_X + G.BIRD_R > q.x - 1 && G.BIRD_X - G.BIRD_R < q.x + G.PIPE_W + 1) { die(); return; }
+    }
+  }
+
+  /* ---------------- drawing ---------------- */
+  function fillC(c, alpha) {
+    G.ctx.fillStyle = "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (alpha === undefined ? 1 : alpha) + ")";
+  }
+  function fillStyleC(c, alpha) {
+    G.ctx.fillStyle = "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + (alpha === undefined ? 1 : alpha) + ")";
+  }
+  function roundRect(x, y, w, h, r) {
+    G.ctx.beginPath();
+    G.ctx.moveTo(x + r, y);
+    G.ctx.arcTo(x + w, y, x + w, y + r, r);
+    G.ctx.arcTo(x + w, y + h, x, y + h, r);
+    G.ctx.arcTo(x, y + h, x, y, r);
+    G.ctx.arcTo(x, y, x + w, y, r);
+    G.ctx.closePath();
+  }
+  function drawHills(off, color) {
+    fillStyleC(color);
+    G.ctx.beginPath();
+    G.ctx.moveTo(0, G.H - G.GROUND + 8);
+    for (var x = 0; x <= G.W + 220; x += 44) {
+      G.ctx.quadraticCurveTo(x + 22, G.H - G.GROUND - 26 + 14 * Math.sin((x + off) / 90), x + 44, G.H - G.GROUND + 8);
+    }
+    G.ctx.lineTo(G.W + 220, G.H + 20);
+    G.ctx.lineTo(-220, G.H + 20);
+    G.ctx.closePath();
+    G.ctx.fill();
+  }
+  function drawGround() {
+    var y = G.H - G.GROUND;
+    fillStyleC(G.GROUND.top);
+    G.ctx.fillRect(0, y - 6, G.W + 200, 10);
+    fillStyleC(G.GROUND.fill);
+    G.ctx.fillRect(0, y, G.W + 200, G.GROUND);
+    fillStyleC(G.GROUND.dot);
+    for (var x = (G.W - 60) - (G.scroll % 26); x < G.W + 26; x += 26) {
+      G.ctx.fillRect(x, y + 14, 12, 6);
+    }
+  }
+  function drawPipe(p) {
+    var top = p.gapY - p.gap / 2;
+    var bot = p.gapY + p.gap / 2;
+    fillStyleC(G.SKY.pipeD);
+    G.ctx.fillRect(p.x - 2, top, G.PIPE_W + 4, bot - top);
+    G.ctx.fillRect(p.x - 2, bot + p.gap / 2, G.PIPE_W + 4, G.H - G.GROUND - (bot + p.gap / 2));
+    fillStyleC(G.SKY.pipe);
+    G.ctx.fillRect(p.x, top, G.PIPE_W, bot - top);
+    G.ctx.fillRect(p.x, bot + p.gap / 2, G.PIPE_W, G.H - G.GROUND - (bot + p.gap / 2));
+    fillStyleC(G.SKY.pipeCap);
+    G.ctx.fillRect(p.x - 2, top - 12, G.PIPE_W + 4, 20);
+    G.ctx.fillRect(p.x - 2, bot + p.gap / 2, G.PIPE_W + 4, 20);
+    fillStyleC(G.SKY.pipeCapD);
+    G.ctx.fillRect(p.x, top - 12, G.PIPE_W, 20);
+    G.ctx.fillRect(p.x, bot + p.gap / 2, G.PIPE_W, 20);
+  }
+  function drawBird() {
+    var b = G.bird;
+    G.ctx.save();
+    G.ctx.translate(G.BIRD_X, b.y);
+    G.ctx.rotate(b.rot);
+    var wing = Math.sin(G.wing) * 0.28;
+    fillStyleC(G.SKY.wing);
+    G.ctx.beginPath(); G.ctx.ellipse(-2, -2, 11, 5 + wing * 4, 0.3, 0, Math.PI * 2); G.ctx.fill();
+    fillStyleC(G.SKY.body);
+    G.ctx.beginPath(); G.ctx.ellipse(0, 0, G.BIRD_R, G.BIRD_R - 2, 0, 0, Math.PI * 2); G.ctx.fill();
+    fillStyleC(G.SKY.belly);
+    G.ctx.beginPath(); G.ctx.ellipse(1, 4, G.BIRD_R - 4, G.BIRD_R - 6, 0, 0, Math.PI * 2); G.ctx.fill();
+    fillStyleC([255, 255, 255]);
+    G.ctx.beginPath(); G.ctx.arc(6, -4, 5, 0, Math.PI * 2); G.ctx.fill();
+    fillStyleC([20, 20, 20]);
+    G.ctx.beginPath(); G.ctx.arc(7.5, -4.5, 2.2, 0, Math.PI * 2); G.ctx.fill();
+    fillStyleC(G.SKY.beak);
+    G.ctx.beginPath(); G.ctx.moveTo(13, -2); G.ctx.lineTo(22, 1); G.ctx.lineTo(13, 5); G.ctx.closePath(); G.ctx.fill();
+    fillStyleC([255, 100, 40]);
+    G.ctx.beginPath(); G.ctx.arc(17, 2, 1.4, 0, Math.PI * 2); G.ctx.fill();
+    G.ctx.restore();
+  }
+  function drawPanel(title, lines, medal) {
+    var w = 280, h = 150 + lines.length * 26 + 30;
+    roundRect(G.W / 2 - w / 2, G.H / 2 - h / 2, w, h, 16);
+    fillStyleC(G.PANEL[0], G.PANEL[1] / 255);
+    G.ctx.fill();
+    G.ctx.lineWidth = 4;
+    G.ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    G.ctx.stroke();
+
+    G.ctx.textAlign = "center";
+    G.ctx.fillStyle = "rgba(30,30,40,1)";
+    G.ctx.font = "bold 34px 'Arial Black', Arial, sans-serif";
+    G.ctx.fillText(title, G.W / 2, G.H / 2 - h / 2 + 44);
+
+    if (medal) {
+      var mY = G.H / 2 - h / 2 + 68;
+      var mc = G.medals === null ? null : null;
+      var colors = { bronze: G.BRONZE, silver: G.SILVER, gold: G.GOLD };
+      var mc2 = colors[medal];
+      G.ctx.beginPath(); G.ctx.arc(G.W / 2, mY, 13, 0, Math.PI * 2);
+      G.ctx.fillStyle = "rgba(255,255,255,0.85)"; G.ctx.fill();
+      fillStyleC(mc2); G.ctx.fill();
+      G.ctx.lineWidth = 3; G.ctx.strokeStyle = "rgba(255,255,255,0.7)"; G.ctx.stroke();
+      G.ctx.fillStyle = "rgba(255,255,255,1)";
+      G.ctx.font = "bold 10px Arial";
+      G.ctx.fillText(medal.slice(0, 1).toUpperCase(), G.W / 2, mY + 4);
+      G.ctx.font = "bold 16px Arial";
+      G.ctx.fillStyle = "rgba(30,30,40,1)";
+      G.ctx.fillText(medal.toUpperCase(), G.W / 2, mY + 24);
+    }
+
+    var baseY = G.H / 2 - h / 2 + 112;
+    for (var i = 0; i < lines.length; i++) {
+      G.ctx.font = lines[i].bold ? "bold 26px Arial" : "16px Arial";
+      G.ctx.fillStyle = lines[i].bold ? "rgba(30,30,40,1)" : "rgba(30,30,40,0.75)";
+      G.ctx.fillText(lines[i].text, G.W / 2, baseY + i * 26);
+      if (i === lines.length - 1 && lines[i].hint) {
+        G.ctx.font = "13px Arial";
+        G.ctx.fillStyle = "rgba(30,30,40,0.6)";
+        G.ctx.fillText(lines[i].hint, G.W / 2, baseY + i * 26 + 18);
+      }
+    }
+  }
+
+  function render() {
+    var ctx = G.ctx;
+    /* letterbox bars */
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, G.canvas.width, G.canvas.height);
+    /* transform into playfield */
+    ctx.setTransform(G.scale * G.dpr, 0, 0, G.scale * G.dpr, G.ox, G.oy);
+
+    /* screen shake */
+    var shake = 0;
+    if (G.shakeT > 0) {
+      shake = Math.sin(G.shakeT * 50) * 7 * (G.shakeT / 0.45);
+    }
+    ctx.save();
+    ctx.translate(shake, shake * 0.5);
+
+    /* sky (day/night blend) */
+    var f = cycle();
+    var cTop = G.lerpC(G.DAY.top, G.NIGHT.top, f);
+    var cBot = G.lerpC(G.DAY.bot, G.NIGHT.bot, f);
+    var grad = ctx.createLinearGradient(0, 0, 0, G.H);
+    grad.addColorStop(0, "rgb(" + cTop.join(",") + ")");
+    grad.addColorStop(1, "rgb(" + cBot.join(",") + ")");
+    ctx.fillStyle = grad;
+    ctx.fillRect(-30, -30, G.W + 60, G.H + 60);
+
+    /* stars (night) */
+    if (f > 0.35) {
+      for (var si = 0; si < 14; si++) {
+        var sx = (si * 97 + 23) % G.W;
+        var sy = (si * 53 + 11) % (G.H * 0.55);
+        ctx.fillStyle = "rgba(255,255,255," + Math.max(0, f - 0.3) * 0.8 + ")";
+        ctx.fillRect(sx, sy, 2, 2);
+      }
+    }
+
+    /* sun / moon */
+    var sunC = G.lerpC(G.DAY.sun, G.NIGHT.sun, f);
+    ctx.beginPath();
+    ctx.arc(280, 80, 26, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    ctx.fill();
+    fillStyleC(sunC);
+    ctx.beginPath(); ctx.arc(280, 80, 20, 0, Math.PI * 2); ctx.fill();
+    if (f > 0.5) {
+      ctx.fillStyle = "rgba(140,150,160,0.35)";
+      ctx.beginPath();
+      ctx.arc(273, 75, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(288, 86, 3.5, 0, Math.PI * 2); ctx.fill();
+    }
+
+    /* clouds (parallax, day-ish) */
+    for (var ci = 0; ci < G.clouds.length; ci++) {
+      var cld = G.clouds[ci];
+      var a = 0.8 - f * 0.4;
+      fillStyleC([255, 255, 255], a);
+      ctx.beginPath();
+      ctx.ellipse(cld.x, cld.y, cld.w, cld.w * 0.5, 0, 0, Math.PI * 2);
+      ctx.ellipse(cld.x - cld.w * 0.6, cld.y + 2, cld.w * 0.55, cld.w * 0.45, 0, 0, Math.PI * 2);
+      ctx.ellipse(cld.x + cld.w * 0.5, cld.y + 2, cld.w * 0.5, cld.w * 0.42, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    /* hills (parallax) */
+    var h1 = G.lerpC(G.DAY.hill1, G.NIGHT.hill1, f);
+    var h2 = G.lerpC(G.DAY.hill2, G.NIGHT.hill2, f);
+    drawHills(G.hills[0], h1);
+    drawHills(G.hills[1], h2);
+
+    drawGround();
+    for (var pi = 0; pi < G.pipes.length; pi++) drawPipe(G.pipes[pi]);
+    drawBird();
+
+    /* HUD */
+    if (G.state === "playing") {
+      ctx.textAlign = "center";
+      ctx.font = "bold 48px Arial";
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.fillText(G.score, G.W / 2, 70);
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.fillText(G.score, G.W / 2, 66);
+    }
+    if (G.state === "title") {
+      ctx.textAlign = "center";
+      ctx.font = "bold 40px 'Arial Black', Arial, sans-serif";
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.fillText("FLAP FLIGHT", G.W / 2, 140);
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.fillText("FLAP FLIGHT", G.W / 2, 136);
+      ctx.font = "bold 22px Arial";
+      ctx.fillStyle = "rgba(30,30,40,1)";
+      ctx.fillText("Best: " + G.best, G.W / 2, 200);
+      ctx.font = "18px Arial";
+      ctx.fillText("Tap / Space / \u2191  to flap", G.W / 2, 300);
+      ctx.fillText("P  pause   M  mute   R  restart", G.W / 2, 330);
+    }
+    if (G.state === "over") {
+      drawPanel("GAME OVER",
+        [
+          { text: "Score: " + G.score, bold: true },
+          { text: "Best: " + G.best, bold: false },
+          { text: "TAP TO RETRY", bold: false, hint: "R to retry" }
+        ], G.medal);
+    }
+    if (G.state === "paused") {
+      drawPanel("PAUSED",
+        [
+          { text: "Tap to resume", bold: true },
+          { text: "M: toggle sound", bold: false }
+        ], null);
+    }
+
+    if (G.flash > 0) {
+      ctx.fillStyle = "rgba(255,255,255," + Math.max(0, G.flash) + ")";
+      ctx.fillRect(-30, -30, G.W + 60, G.H + 60);
+    }
+    if (G.muted) {
+      ctx.textAlign = "center";
+      ctx.font = "12px Arial";
+      ctx.fillStyle = "rgba(255,255,255,0.5)";
+      ctx.fillText("MUTE  (M)", 20, G.H - 14);
+    }
+
+    ctx.restore();
+  }
+
+  /* ---------------- input ---------------- */
+  function flap() {
+    G.bird.vy = G.FLAP;
+    G.wing = 0;
+    sfxFlap();
+  }
+  function action() {
+    if (G.state === "playing") {
+      flap();
+    } else if (G.state === "paused") {
+      G.state = "playing";
+    } else {
+      startGame();
+    }
+  }
+  function togglePause() {
+    if (G.state === "playing") G.state = "paused";
+    else if (G.state === "paused") G.state = "playing";
+  }
+  function toggleMute() { G.muted = !G.muted; }
+
+  window.addEventListener("keydown", function (e) {
+    var k = e.key.toLowerCase();
+    if (k === "m") { toggleMute(); e.preventDefault(); return; }
+    if (k === "p" || k === "enter") {
+      if (G.state === "over") { startGame(); }
+      else togglePause();
+      e.preventDefault(); return;
+    }
+    if (k === "r") { startGame(); e.preventDefault(); return; }
+    if (k === " " || k === "arrowup") {
+      e.preventDefault();
+      audioInit();
+      action();
+      return;
+    }
+  });
+  window.addEventListener("pointerdown", function (e) {
+    audioInit();
+    action();
+    e.preventDefault();
+  });
+  window.addEventListener("wheel", function (e) { e.preventDefault(); }, { passive: false });
+  window.addEventListener("contextmenu", function (e) { e.preventDefault(); }, { passive: false });
+
+  /* ---------------- resize & fixed-timestep loop ---------------- */
+  function resize() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var dpr = Math.round((window.devicePixelRatio || 1) * 2) / 2;
+    dpr = Math.min(dpr, 2);
+    G.dpr = dpr;
+    var scale = Math.min(vw / G.W, vh / G.H);
+    G.scale = scale;
+    G.ox = (vw - G.W * scale) / 2;
+    G.oy = (vh - G.H * scale) / 2;
+    G.canvas.width = Math.round(vw * dpr);
+    G.canvas.height = Math.round(vh * dpr);
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  function frame(t) {
+    var dt = Math.min((t - G.last) / 1000, 0.1);
+    G.last = t;
+    if (G.state === "playing") {
+      G.acc += dt;
+      var steps = 0;
+      while (G.acc >= G.FIXED && steps < 8) {
+        update(G.FIXED);
+        G.acc -= G.FIXED;
+        steps++;
+      }
+      if (steps >= 8) G.acc = 0;
+    }
+    render();
+    requestAnimationFrame(frame);
+  }
+  G.last = performance.now();
+  requestAnimationFrame(frame);
+
+  /* single namespace object exposed (only global) */
+  window.FlapGame = G;
+})();
+</script>
+</body>
+</html>

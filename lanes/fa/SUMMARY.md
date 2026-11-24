@@ -1,0 +1,9 @@
+# prism-pascal-fa: sm_61 decode flash attention (P104-100), Bonsai 2 27B (24 q / 4 kv heads, D=256)
+Kernel: fattn-vec-p61.cuh `flash_attn_ext_vec_p61`, hooked in fattn.cu ggml_cuda_flash_attn_ext; cc 6.1 only. One block per KV head serves all 6 GQA heads (KV read once), KV split over ~60 blocks + combine, dp4a K*Q on int8 Q, exact magic-float V dequant, fp32 math. K in {q4_0,q8_0}, V in {q4_0,q8_0,f16}, 1..4 query tokens. Patch: fa.patch (v4); binaries: bin-v4.
+Gates (env): GGML_CUDA_FA_P61=0 kill switch; GGML_CUDA_FA_P61_MIN_KV (1 token, default 0); GGML_CUDA_FA_P61_MIN_KV_MULTI (2..4 tokens, default 4096); GGML_CUDA_FA_P61_MAX_NQ (default 4); tuning only: GGML_CUDA_FA_P61_BLOCKS, GGML_CUDA_FA_P61_MINB (2).
+Build: FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" (no q8_0-q4_0) so short-KV fallbacks take the REF f16-convert path, which is faster there.
+Op (us/layer, 1 token, stock -> p61): q4/q4 4k 428->70, 16k 1623->168, 61k 6031->549; q8/q8 61k 2518->650; K q8/V q4 61k 5133->585; 2 tokens q4/q4 61k 7754->1442.
+llama-bench tg64, q4_0 KV, -ub 256 (REF -> p61): d0 28.78->29.01, d16k 16.26->27.02, d32k 11.42->25.37, d49k 8.83->23.92 tok/s. MTP serving, 15k prompt: 21.1->29.6 tok/s.
+Correctness: test-backend-ops FLASH_ATTN_EXT 260/260 (MIN_KV=0). KLD vs REF ctx 8192 ub 4: q8/q4 3.14e-4, q8/q8 8.6e-5, q4/q4 1.11e-3 (REF own decode-vs-batch spread is 1.15e-3).
+OPEN: at short KV (<~1k) the 2..4-token (MTP verify) path lowered draft acceptance (501 vs 561-586 of ~630); root cause not found (op tests pass), hence MIN_KV_MULTI=4096. 1-token p61 at short KV is fine and fastest (48.7 vs REF 46.7 tok/s). fa-serve2 (validates v4 defaults) was still queued.
+Not done: prefill (tile kernel, ~2.5 TFLOPS) unchanged; chunked-prefill design in chunked-prefill.wip.patch + .README.md (never built).

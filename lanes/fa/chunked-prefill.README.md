@@ -1,0 +1,5 @@
+# chunked-prefill.wip.patch: NOT built, NOT tested (stopped: serving at 49152 ctx instead of 64k)
+Design: on the TILE path with quantized K/V and n_kv > GGML_CUDA_FA_CHUNK (default 16384, 0=off), process KV in chunks: convert each chunk to f16 into a chunk-sized scratch behind dst, run the tile kernel with forced parallel_blocks>=2 writing unnormalized partials+(max,sum) into reserved buffers (launch_fattn hook via inline thread_local ggml_cuda_fattn_chunk_out_ptr), fold into a running (dst,max,sum) accumulator with k_fattn_chunk_merge.
+get_alloc_size returns the matching layout (K chunk, V chunk, P partials <=16 MiB, meta, accm), so no pool growth. Expected at 64k: f16 scratch 256 MiB -> ~77 MiB (~179 MiB saved).
+Applies against prism-pascal-best2/src (fattn.cu, fattn-common.cuh; tree restored to original). State: never compiled; needs test-backend-ops cases at n_kv 16k/32k/64k x n_q 5..256 (also with GGML_CUDA_FA_CHUNK=4096) and a 30k-prompt KLD vs unchunked before use.
+Risk points: reservation must match get_f16_extra_data placement exactly (asserted per chunk); fully-masked chunks rely on the -FLT_MAX/2 meta handling in the merge.

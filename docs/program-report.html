@@ -1,0 +1,83 @@
+<title>P104 Program Report</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root{--bg:#f6f4ef;--fg:#1d1b17;--muted:#6b665c;--accent:#b4541e;--accent-ink:#ffffff;--card:#ffffff;--line:#e2ddd2;--good:#2e7d4f;--warn:#9a6b00;--code:#ece8df}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#15130f;--fg:#ece7dc;--muted:#a39c8e;--accent:#e2834a;--accent-ink:#15130f;--card:#1e1b16;--line:#2e2a23;--good:#6fcf97;--warn:#e0b14a;--code:#262219;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#15130f;--fg:#ece7dc;--muted:#a39c8e;--accent:#e2834a;--accent-ink:#15130f;--card:#1e1b16;--line:#2e2a23;--good:#6fcf97;--warn:#e0b14a;--code:#262219;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:16px/1.55 Georgia,"Iowan Old Style","Times New Roman",serif;margin:0}
+.wrap{max-width:860px;margin:0 auto;padding-block:32px 64px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+h1{font-size:2rem;line-height:1.15;margin:0 0 .25rem;text-wrap:balance}
+h2{font-size:1.25rem;margin:2.2rem 0 .6rem;text-wrap:balance;border-top:1px solid var(--line);padding-top:1.2rem}
+.sub{color:var(--muted);margin:0 0 1.5rem}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:1.2rem 0}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+.kpi .v{font:600 1.5rem/1.1 ui-monospace,Menlo,Consolas,monospace;color:var(--accent)}
+.kpi .l{color:var(--muted);font-size:.85rem;margin-top:4px;letter-spacing:.01em}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:.93rem}
+th,td{padding:8px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+th{font-weight:600;color:var(--muted);font-size:.8rem;letter-spacing:.04em;text-transform:uppercase}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:nowrap}
+.good{color:var(--good)} .warn{color:var(--warn)}
+code{font:.88em ui-monospace,Menlo,Consolas,monospace;background:var(--code);padding:1px 5px;border-radius:4px}
+ul{padding-left:1.2rem} li{margin:.3rem 0}
+p{max-width:68ch}
+.note{border-left:3px solid var(--accent);padding:.2rem 0 .2rem 1rem;color:var(--muted)}
+</style>
+<div class="wrap">
+<h1>P104 Program Report</h1>
+<p class="sub">Bonsai 27B ternary on one NVIDIA P104-100 · 23–24 November 2026 · quasar</p>
+
+<p>Goal: make a mining-grade 8 GB Pascal card run a 27B ternary model well enough to serve as a coding agent's inference engine, with long context on the card, at low power, with the model's output statistically unchanged. The work ran as one coordinator plus eleven specialist agents on a serialized GPU queue, every change proven on op tests and logit divergence before it counted.</p>
+
+<div class="kpis">
+<div class="kpi"><div class="v">2.6×</div><div class="l">decode with the draft head (16 → 42 tok/s)</div></div>
+<div class="kpi"><div class="v">2.7×</div><div class="l">decode at 49k context (8.8 → 23.9)</div></div>
+<div class="kpi"><div class="v">+95 %</div><div class="l">prefill (92.6 → 181 tok/s)</div></div>
+<div class="kpi"><div class="v">−29 %</div><div class="l">power (180 → 128 W)</div></div>
+<div class="kpi"><div class="v">3.6e-4</div><div class="l">mean KL divergence vs reference</div></div>
+</div>
+
+<h2>Before and after</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>Measure</th><th class="num">Day 1, stock fork</th><th class="num">Served build (best8)</th><th class="num">Change</th></tr></thead>
+<tbody>
+<tr><td>Prefill, pp512</td><td class="num">92.6</td><td class="num">181</td><td class="num good">+95 %</td></tr>
+<tr><td>Decode, single token</td><td class="num">17.8</td><td class="num">29.2</td><td class="num good">+64 %</td></tr>
+<tr><td>Decode with native draft head, code</td><td class="num">16</td><td class="num">42.2</td><td class="num good">2.6×</td></tr>
+<tr><td>Short prompt, full serving recipe</td><td class="num">46.4 (ref)</td><td class="num">50.3</td><td class="num good">+8 %</td></tr>
+<tr><td>30k-token edit turn</td><td class="num">20.2 (ref)</td><td class="num">23.5</td><td class="num good">+16 %, +39 % more on partial edits</td></tr>
+<tr><td>Decode at 16k / 32k / 49k context</td><td class="num">16.3 / 11.4 / 8.8</td><td class="num">27.0 / 25.2 / 23.9</td><td class="num good">1.7× / 2.2× / 2.7×</td></tr>
+<tr><td>Context on the card</td><td class="num">20k (f16 cache)</td><td class="num">48k (4-bit caches)</td><td class="num good">2.4×</td></tr>
+<tr><td>Power under load</td><td class="num">~180 W</td><td class="num">128 W cap</td><td class="num good">−29 %</td></tr>
+<tr><td>Memory clock</td><td class="num">5005 MHz</td><td class="num">5054 MHz</td><td class="num">+100 offset, gated ladder clean to +200</td></tr>
+<tr><td>Output quality</td><td class="num">—</td><td class="num">KLD 3.6e-4, top-1 99.6 %</td><td class="num">unchanged tier</td></tr>
+</tbody></table></div>
+<p class="note">All speeds in tokens per second, same card, same model file, interleaved against the reference build in the same job. The 42.2 and 50.3 figures are greedy code generation with drafting; the context-depth rows are plain decode.</p>
+
+<h2>What was built</h2>
+<ul>
+<li><strong>Ternary decode kernel for sm_61</strong> (program 1): octet geometry, dp4a decode, CUDA graphs, FWHT fusion. 1.65× decode, 2× prefill over the stock fork.</li>
+<li><strong>Flash-attention decode kernel for Pascal</strong>: attention at 61k context from 6.0 to 0.6 ms per layer; decode nearly flat with depth. Gated so its multi-token verify path only engages above 4k context, where it is clean.</li>
+<li><strong>Prefill tile</strong> (+9 % prefill) with a measured dispatch threshold (128 columns) so mid-size verify batches keep the faster older path.</li>
+<li><strong>Multi-column verify kernel</strong>: 2–4 draft tokens now cost 1.04–1.11× one token instead of 1.4–2.7×; drafting at depth 2–3 pays. Plus a bit-identical accumulator trick worth 2–5 % on verify mat-vecs.</li>
+<li><strong>Device-resident recurrent checkpoint</strong>: a 127-line server fix that stops a 150 MiB state copy crossing the Gen1 x2 link on long drafts. Save 389 → 16 ms; +39–41 % on edit turns with partial acceptance; restore path proven, text byte-identical.</li>
+<li><strong>Model-side decisions</strong>, all measured: K/V cache types (q8/q4 best quality per byte, q4/q4 chosen to fit 48k), the thinking-close edit ported byte-exactly onto the serving file, n-gram drafting stacked on the native MTP head, tool calling verified 5/6.</li>
+<li><strong>Infrastructure</strong>: a GPU job queue with session-level cleanup and name-based timeouts, a one-command cut-over between serving and research, a verification battery (op tests, interleaved benches at 0/16k/32k, KL divergence, two serving turns, temp-0 text compare), a 128 W power cap and memory offset applied at boot.</li>
+</ul>
+
+<h2>What was ruled out, with data</h2>
+<p>The single-token decode kernel sits at about 70 % of memory bandwidth, and every structural alternative was built and measured against it: register cap (−1.8 %), persistent grid (−3.5 %), K-split (−18 / −37 %), permute-free decode (−9.5 %), two-deep prefetch (−7 / −14 %), activation-stationary verify (−40 %), direct load without shared memory (±4 %). Probes show a 52 µs compute floor and a 65 µs weight stream that do not overlap; the staging hand-off serializes them and Pascal has no asynchronous copy to break it. Also rejected: GPU-side sampling (no gain with the real sampler), activation sparsity (quality), an attention build without the native mixed-KV instance (slower), 64k context on 8 GB (loads, but no headroom under load).</p>
+
+<h2>State at close</h2>
+<ul>
+<li>Serving: <code>bonsai-best.service</code> on quasar port 8097, build best8, 48k context, 4-bit caches, draft head + n-gram at depth 3, device checkpoint on, 128 W, memory +100. Health OK, zero restarts since cut-over.</li>
+<li>Switching: <code>sudo bonsai-queue-resume</code> hands the card to the research queue; <code>sudo bonsai-cutover &lt;bin&gt;</code> brings serving back.</li>
+<li>Ready but not landed: three bit-identical graph fusions (+1.5 % decode) and a bf16 SSM mat-vec kernel (+2 %, untested on the card); together a best9 worth about +3 % for one build and one 18-minute verification.</li>
+<li>Open: quasar's host RAM (three compilers segfaulted overnight; run a memory test), continuous batching numbers (job hangs client-side), 64k context for Hermes Agent (needs the P40 or two cards; chunked-prefill attention design saved).</li>
+</ul>
+
+<h2>Where the next gains are</h2>
+<p>On this silicon the kernel side is closed. Decode speed now scales with memory bandwidth and tokens per step: the memory clock (clean to +200 in the gated ladder, set conservatively at +100), draft acceptance, and the two small fixes above. For the production box, the same build runs 64k on the P40 or across two P104s with room to spare, and the Hermes requirement is met there.</p>
+</div>
