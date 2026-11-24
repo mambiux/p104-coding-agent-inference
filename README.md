@@ -1,6 +1,6 @@
 # P104-100 coding-agent inference: findings, recipe, and what we did
 
-**A 27B model, 2.6× faster, on a €30 graphics card from 2016, with its output provably unchanged.**
+**A 27B model, 2.6× faster, on a €30 graphics card from 2016, with its logits within 3.6e-4 KL of the reference.**
 
 ![Before and after: prefill 92.6 → 181 tok/s, decode 17.8 → 29.2, drafted decode 16 → 42.2, decode at 49k context 8.8 → 23.9](docs/before-after.svg)
 
@@ -8,7 +8,11 @@ This is the complete record of a two-day program that turned a single **NVIDIA P
 compute capability 6.1, 8 GB GDDR5X, PCIe Gen1 x2 on this host, passively cooled mining card) into a
 coding-agent inference engine for **Bonsai 2 27B** (PTQ1_0 ternary): the kernels, the serving recipe,
 the verification method, every measurement, and every idea that did not work. Each change was proven
-on op tests and logit divergence against the reference before it counted.
+on op tests and logit divergence against the reference before it counted. What that proves and what
+it does not: mean KL divergence of 3.6e-4 and 99.6 % top-1 agreement on the evaluated code tokens
+show the served build's logits are close to the reference's; they do not by themselves establish
+equal outcomes on coding tasks. A task-level scoreboard is the next piece of evidence (see
+"What comes next").
 
 Who this is for:
 
@@ -50,9 +54,13 @@ power, and starts the server with the stock web UI. Details, options and trouble
 | Context on the card | 20k (f16 cache) | 48k (4-bit caches) | 2.4× |
 | Power under load | ~180 W | 128 W cap | −29 % |
 | Memory clock | 5005 MHz | 5054 MHz | +100 offset; gated ladder clean to +200 |
-| Output quality vs reference | — | KLD 3.6e-4 mean, top-1 99.6 % | unchanged tier |
+| Logit agreement vs reference | — | KLD 3.6e-4 mean, top-1 99.6 % | measured on 2k code tokens |
 
-All speeds in tokens per second, interleaved against the reference build in the same job.
+All speeds in tokens per second. Two baselines are mixed in this table and are labelled: "Day 1,
+stock fork" is the unmodified PrismML fork as first measured (llama-bench, stock power); rows marked
+"(reference)" compare the served build against the reference build in the same interleaved job at
+128 W with the same serving recipe, which is the fair kernel-to-kernel comparison. Exact
+configurations for every row are in the bench page.
 The full tables, including every intermediate measurement, are in `docs/bench-and-findings.html`;
 the one-page summary is `docs/program-report.html`.
 
@@ -187,10 +195,12 @@ structural alternative built and measured against it:
 | Activation-stationary verify (n = 2–4) | −40 %: already issue/latency-bound at ~2 warps/scheduler |
 | Direct load, no shared-memory staging | ±4 % |
 
-Probes: 52 µs with weight loads removed (compute floor), ~65 µs for the weight stream alone; they
-do not overlap, and the per-step staging hand-off (loads → registers → shared memory → sync → loads)
-serializes them. Pascal has no asynchronous copy to break that. Further decode speed on this card
-comes from bandwidth and tokens per step, not the kernel.
+Probes: 52 µs with weight loads removed, ~65 µs for the weight stream alone; the probes are not
+additive (removing work changes scheduling), but they point at the per-step staging hand-off
+(loads → registers → shared memory → sync → loads) as what keeps compute and the weight stream from
+overlapping, and Pascal has no asynchronous copy to break it. These results rule out the designs we
+tested under these conditions; they do not prove the kernel cannot be improved. Untested directions
+are listed under "What comes next".
 
 Also rejected: GPU-side sampling (no gain with the real sampler), activation sparsity (KLD
 0.019–0.088), LM-head shortlist, L2 persistence (unsupported on cc 6.1), PQ2_0 pack (same quality,
@@ -203,8 +213,34 @@ Also rejected: GPU-side sampling (no gain with the real sampler), activation spa
   residual add folded, GDN tail in one kernel), bit-identical after a rounding-order fix, launches
   1135 → 887, +1.3–1.5 % decode. Plus an sm_61 bf16 mat-vec kernel for the two SSM projections that
   run 4.7× off bandwidth (≈ +2 %), written and compiling but never run on the card (opt-in).
-* `lanes/fa/chunked-prefill.wip.patch`: chunked prefill attention to reclaim ~190 MiB at 64k; the
-  design for the production box.
+* `lanes/fa/chunked-prefill.wip.patch`: chunked prefill attention to reclaim ~190 MiB at 64k. Treat
+  64k on 8 GB as an experiment: 190 MiB is not shown to cover the whole request lifecycle (prefill,
+  drafting, rejection, restore, long generation); peak-allocation profiling comes first.
+
+## What comes next
+
+Measured in tasks completed per hour on the same card, not tokens per second. In order:
+
+1. **A fixed coding-task suite** (30–50 tasks: bug fixes, edits, tool calls, browser deliverables)
+   run against the stock fork, the served build and the 9B configuration, with elapsed time and
+   energy per passing task. Every later change is judged by it.
+2. **Diagnostics inside the agent loop**: after each edit, run the parser, linter, type checker,
+   targeted tests and, for UI work, the headless browser; feed concise failures back. The game test
+   above is the evidence: a duplicate-key bug survived two symptom-only repair rounds and fell in one
+   round once the root cause was stated.
+3. **Adaptive speculation**: per-stage telemetry (draft, verify, checkpoint/restore, committed
+   tokens) and a controller that picks the draft depth per workload by cost per committed token,
+   with hysteresis, compared against the best fixed depth on held-out work. Edits, fresh code and
+   prose already behave differently here.
+4. **Context reuse**: stable prefixes first, measured prefix-cache hits, prefill avoided on repeated
+   repository content.
+5. **Land the pending kernels one at a time**: the fusion patch, then the bf16 projection kernel.
+6. **Memory headroom by measurement**: peak allocations through the whole request lifecycle, then
+   admission limits, then a worst-case soak with no OOM.
+7. **Kernel bets still open**: wider weight-sharing verification tiles (4–8 columns, measured with
+   recurrent-state and rollback costs included); a 27-entry ternary lookup via warp registers and
+   shuffles (a Pascal-specific experiment, cost of table construction included); KV-tile reuse
+   across verification queries at 16k–49k depth. Each with the same proof bar.
 
 ## Lessons
 
@@ -217,7 +253,9 @@ Also rejected: GPU-side sampling (no gain with the real sampler), activation spa
   order the cards differently.
 * Hidden stderr hides crashes. Keep it in the job log.
 * A suspect host (compiler segfaults in three different binaries) can still produce correct
-  artifacts if every build is retried and every artifact is verified; but run the memory test.
+  artifacts if every build is retried and every artifact is verified. This is an unresolved
+  reliability issue, not a solved one: the host's memory has not been tested yet, and the builds
+  should be reproduced on a stable machine before anyone depends on them.
 
 ## Layout
 
