@@ -2,7 +2,7 @@
 
 **A 27B model, 2.6× faster, on a €30 graphics card from 2016, with its output provably unchanged.**
 
-![Before and after: prefill 92.6 → 181 tok/s, decode 17.8 → 29.2, drafted decode 16 → 42.2, decode at 49k context 8.8 → 23.9](docs/before-after.png)
+![Before and after: prefill 92.6 → 181 tok/s, decode 17.8 → 29.2, drafted decode 16 → 42.2, decode at 49k context 8.8 → 23.9](docs/before-after.svg)
 
 This is the complete record of a two-day program that turned a single **NVIDIA P104-100** (GP104,
 compute capability 6.1, 8 GB GDDR5X, PCIe Gen1 x2 on this host, passively cooled mining card) into a
