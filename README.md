@@ -207,5 +207,6 @@ more than they led us to believe. Our only contribution was to go looking.
 ## License
 
 PolyForm Noncommercial 1.0.0: free for noncommercial use with credit to the author; commercial
-use requires a paid license, see `COMMERCIAL.md`. Third-party components (llama.cpp, the PrismML
+use requires a paid license (team €990/yr, department €4,900/yr, product €14,900/yr, port
+engagements from €9,800), see `COMMERCIAL.md`. Third-party components (llama.cpp, the PrismML
 fork, the Bonsai model) keep their own licenses.
