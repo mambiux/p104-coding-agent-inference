@@ -198,8 +198,8 @@ are ours (`quasar` = the card's host; the tailnet addresses were replaced with p
 
 ## Credits
 
-Built on the [PrismML](https://github.com/PrismML-Eng/llama.cpp) fork of llama.cpp and its ternary
-formats, on the Bonsai 2 27B model from [PrismML](https://huggingface.co/prism-ml) (the served file
-is a community condensed/edited variant of it, see the model lane notes), on
-[llama.cpp](https://github.com/ggml-org/llama.cpp) itself, and on NVIDIA's GP104, which turned out
-to hold more magic per chip than even they knew.
+This work stands on the [PrismML](https://github.com/PrismML-Eng/llama.cpp) fork of llama.cpp and
+its ternary formats; on the Bonsai 2 27B model from [PrismML](https://huggingface.co/prism-ml) (the
+served file is a community condensed and edited variant, see the model lane notes); on
+[llama.cpp](https://github.com/ggml-org/llama.cpp) itself; and on NVIDIA's GP104, a chip that holds
+more than they led us to believe. Our only contribution was to go looking.
