@@ -27,7 +27,7 @@ p{max-width:68ch}
 </style>
 <div class="wrap">
 <h1>P104 Program Report</h1>
-<p class="sub">Bonsai 27B ternary on one NVIDIA P104-100 · 23–24 November 2026 · quasar</p>
+<p class="sub">Bonsai 27B ternary on one NVIDIA P104-100 · 23–24 November 2026 · gpu-host</p>
 
 <p>Goal: make a mining-grade 8 GB Pascal card run a 27B ternary model well enough to serve as a coding agent's inference engine, with long context on the card, at low power, with the model's output statistically unchanged. The work ran as one coordinator plus eleven specialist agents on a serialized GPU queue, every change proven on op tests and logit divergence before it counted.</p>
 
@@ -72,10 +72,10 @@ p{max-width:68ch}
 
 <h2>State at close</h2>
 <ul>
-<li>Serving: <code>bonsai-best.service</code> on quasar port 8097, build best8, 48k context, 4-bit caches, draft head + n-gram at depth 3, device checkpoint on, 128 W, memory +100. Health OK, zero restarts since cut-over.</li>
+<li>Serving: <code>bonsai-best.service</code> on gpu-host port 8097, build best8, 48k context, 4-bit caches, draft head + n-gram at depth 3, device checkpoint on, 128 W, memory +100. Health OK, zero restarts since cut-over.</li>
 <li>Switching: <code>sudo bonsai-queue-resume</code> hands the card to the research queue; <code>sudo bonsai-cutover &lt;bin&gt;</code> brings serving back.</li>
 <li>Ready but not landed: three bit-identical graph fusions (+1.5 % decode) and a bf16 SSM mat-vec kernel (+2 %, untested on the card); together a best9 worth about +3 % for one build and one 18-minute verification.</li>
-<li>Open: quasar's host RAM (three compilers segfaulted overnight; run a memory test), continuous batching numbers (job hangs client-side), 64k context for Hermes Agent (needs the P40 or two cards; chunked-prefill attention design saved).</li>
+<li>Open: gpu-host's host RAM (three compilers segfaulted overnight; run a memory test), continuous batching numbers (job hangs client-side), 64k context for Hermes Agent (needs the P40 or two cards; chunked-prefill attention design saved).</li>
 </ul>
 
 <h2>Where the next gains are</h2>

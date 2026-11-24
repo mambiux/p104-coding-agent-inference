@@ -3,8 +3,8 @@ Description=Qwen3.5-9B Q5_K_M coding server on the P104 (upstream llama.cpp, 64k
 After=network.target p104-power-cap.service
 Conflicts=bonsai-best.service
 [Service]
-User=mbx
-ExecStart=/home/mbx/longshot/qwen9b-serve.sh
+User=<user>
+ExecStart=/home/<user>/longshot/qwen9b-serve.sh
 Restart=on-failure
 RestartSec=10
 [Install]

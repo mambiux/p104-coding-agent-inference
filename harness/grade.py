@@ -1,5 +1,5 @@
 import json, re, subprocess, os, sys, shutil
-base = '/home/mbx/attic/longshot/cmp'
+base = '/home/<user>/attic/longshot/cmp'
 for model in ('bonsai', 'qwen'):
     for task in ('A', 'B'):
         f = f'{base}/{model}-{task}.json'

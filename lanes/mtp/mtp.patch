@@ -1,6 +1,6 @@
-diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq.cu
---- /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-23 21:23:43.535074704 +0100
-+++ /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-24 03:02:36.266946545 +0100
+diff -ru /home/<user>/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu /home/<user>/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq.cu
+--- /home/<user>/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-23 21:23:43.535074704 +0100
++++ /home/<user>/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq.cu	2026-11-24 03:02:36.266946545 +0100
 @@ -328,11 +328,25 @@
      return MMVQ_MAX_BATCH_SIZE;
  }
@@ -27,9 +27,9 @@ diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq.cu /
      if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
          // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
          // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
-diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
---- /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh	2026-11-23 21:10:53.047261370 +0100
-+++ /home/mbx/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh	2026-11-24 03:02:36.267422946 +0100
+diff -ru /home/<user>/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh /home/<user>/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh
+--- /home/<user>/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh	2026-11-23 21:10:53.047261370 +0100
++++ /home/<user>/CORE/llama/prism-pascal-mtp/src/ggml/src/ggml-cuda/mmvq-ptq1_0.cuh	2026-11-24 03:02:36.267422946 +0100
 @@ -249,9 +249,29 @@
  // count.
  // ---------------------------------------------------------------------------
@@ -103,8 +103,8 @@ diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1
          default: return false;
      }
      return true;
---- /home/mbx/CORE/llama/prism-pascal-best/src/tests/test-backend-ops.cpp	2026-11-23 21:10:53.196183510 +0100
-+++ /home/mbx/CORE/llama/prism-pascal-mtp/src/tests/test-backend-ops.cpp	2026-11-24 01:54:36.945543399 +0100
+--- /home/<user>/CORE/llama/prism-pascal-best/src/tests/test-backend-ops.cpp	2026-11-23 21:10:53.196183510 +0100
++++ /home/<user>/CORE/llama/prism-pascal-mtp/src/tests/test-backend-ops.cpp	2026-11-24 01:54:36.945543399 +0100
 @@ -14170,6 +14170,17 @@
          }
      }
@@ -123,8 +123,8 @@ diff -ru /home/mbx/CORE/llama/prism-pascal-best/src/ggml/src/ggml-cuda/mmvq-ptq1
      // speculative decoding attention: the DFlash2 drafter block (hd 128, 8 KV heads x 4,
      // 8 queries, 2048 sliding window) and the 27B target's verify (hd 256, 4 KV heads x 6)
      for (int nb : {1, 8, 16}) {
---- /home/mbx/CORE/llama/prism-pascal-best/src/tools/server/server-context.cpp	2026-11-23 21:10:53.210838584 +0100
-+++ /home/mbx/CORE/llama/prism-pascal-mtp/src/tools/server/server-context.cpp	2026-11-24 04:43:41.663334712 +0100
+--- /home/<user>/CORE/llama/prism-pascal-best/src/tools/server/server-context.cpp	2026-11-23 21:10:53.210838584 +0100
++++ /home/<user>/CORE/llama/prism-pascal-mtp/src/tools/server/server-context.cpp	2026-11-24 04:43:41.663334712 +0100
 @@ -293,6 +293,9 @@
      common_speculative * spec;
      int32_t spec_depth_max = 0; // no drafting once the sequence is longer than this (0 = always draft)

@@ -2,7 +2,7 @@
 """fixloop.py <key> <start.html> [rounds] — generate→run→feed errors→fix loop against the llama-server on 127.0.0.1:8097 (tunnel)."""
 import json, sys, subprocess, re, time, urllib.request
 key, start = sys.argv[1], sys.argv[2]; rounds = int(sys.argv[3]) if len(sys.argv) > 3 else 4; base = int(sys.argv[5]) if len(sys.argv) > 5 else 0
-W = "/home/mbx/attic/longshot"; PW = "/home/mbx/.claude/jobs/44d7028b/tmp/pw"
+W = "/home/<user>/attic/longshot"; PW = "/home/<user>/.claude/jobs/44d7028b/tmp/pw"
 prompt = open(f"{W}/prompt.md").read(); log = open(f"{W}/{key}-fixloop.log", "a"); results = []
 def say(m): print(m, flush=True); log.write(time.strftime("%H:%M:%S ") + m + "\n"); log.flush()
 def harness(path):

@@ -5,7 +5,7 @@ Running a 27B ternary model (Bonsai 2 27B, PTQ1_0) as a coding-agent inference e
 cooling, ~€30 mining card), with long context on the card, low power, and output statistically
 unchanged from the reference build.
 
-Work done 23–24 November 2026 on `quasar` (the dev box), by one coordinator and eleven specialist
+Work done 23–24 November 2026 on `gpu-host` (the dev box), by one coordinator and eleven specialist
 agents on a serialized GPU queue. Every change was proven on op tests and logit divergence against
 the reference before it counted. This repository holds the results, the exact recipe, every patch,
 the scripts, and the negative results so nobody repeats them.
@@ -194,7 +194,7 @@ harness/   headless-browser tests for generated pages and games, fix loop, grade
 ```
 
 Model files are not included. The base fork and the model are public; the machines in the scripts
-are ours (`quasar` = the card's host; the tailnet addresses were replaced with placeholders).
+are ours (`gpu-host` = the card's host; the tailnet addresses were replaced with placeholders).
 
 ## Credits
 

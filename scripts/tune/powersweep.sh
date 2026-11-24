@@ -1,6 +1,6 @@
 #!/bin/bash
 # Power-limit sweep on the P104 with the merged build + MTP head: decode and prefill tok/s, mean watts, tokens per joule. Runs as root (needs nvidia-smi -pl).
-B=/home/mbx/CORE/llama/prism-pascal-best/bin; M=/home/mbx/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/mbx/longshot/tune
+B=/home/<user>/CORE/llama/prism-pascal-best/bin; M=/home/<user>/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/<user>/longshot/tune
 UUID=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader | grep P104 | awk -F', ' '{print $2}')
 while ! grep -q "KVQUALITY DONE" $T/kvquality.log; do sleep 15; done
 pkill -f "llama-server.*--port 8097" 2>/dev/null; sleep 1
@@ -13,12 +13,12 @@ echo "limit_W | decode tok/s | mean W decode | tok/J decode | SM MHz | temp | pr
 for pl in 180 165 150 135 120 110 105 90; do
   nvidia-smi -i 0 -pl $pl >/dev/null 2>&1; sleep 2
   nvidia-smi -i 0 --query-gpu=power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits -lms 500 > $T/pw.csv 2>/dev/null & S=$!
-  g=$(curl -s -m 600 http://127.0.0.1:8097/v1/chat/completions -H 'Content-Type: application/json' --data @$T/gen600.json | python3 /home/mbx/longshot/tune/pps.py); kill $S 2>/dev/null; sleep 0.3
+  g=$(curl -s -m 600 http://127.0.0.1:8097/v1/chat/completions -H 'Content-Type: application/json' --data @$T/gen600.json | python3 /home/<user>/longshot/tune/pps.py); kill $S 2>/dev/null; sleep 0.3
   read wg cg tg <<< $(awk -F', ' 'NR>2{w+=$1;c+=$2;t=($3>t)?$3:t;n++} END{printf "%.0f %.0f %d", w/n, c/n, t}' $T/pw.csv)
   # prefill: fresh prompt each time (cache-reuse 0; vary the first word to defeat the prompt cache)
   sed "s/The quick brown fox/Prompt$pl quick brown fox/" $T/pp4k.json > $T/pp4k-$pl.json
   nvidia-smi -i 0 --query-gpu=power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits -lms 500 > $T/pw2.csv 2>/dev/null & S=$!
-  p=$(curl -s -m 600 http://127.0.0.1:8097/v1/chat/completions -H 'Content-Type: application/json' --data @$T/pp4k-$pl.json | python3 /home/mbx/longshot/tune/ppp.py); kill $S 2>/dev/null; sleep 0.3
+  p=$(curl -s -m 600 http://127.0.0.1:8097/v1/chat/completions -H 'Content-Type: application/json' --data @$T/pp4k-$pl.json | python3 /home/<user>/longshot/tune/ppp.py); kill $S 2>/dev/null; sleep 0.3
   wp=$(awk -F', ' 'NR>2{w+=$1;n++} END{printf "%.0f", w/n}' $T/pw2.csv)
   echo "$pl | $g | $wg | $(python3 -c "print(round($g/$wg,3))") | $cg | $tg | $p | $wp | $(python3 -c "print(round($p/$wp,2))")"
 done

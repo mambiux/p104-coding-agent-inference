@@ -1,6 +1,6 @@
 #!/bin/bash
 # continuous-batching throughput per card: -np 1/2/4 with concurrent code-gen requests; serving config (q4_0 KV, ub 256, MTP depth 2, 128 W cap). CUDA_VISIBLE_DEVICES set by gpuq.
-B=/home/mbx/CORE/llama/prism-pascal-best/bin; M=/home/mbx/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/mbx/longshot/tune
+B=/home/<user>/CORE/llama/prism-pascal-best/bin; M=/home/<user>/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/<user>/longshot/tune
 PROMPTS=("Write a Python module implementing an LRU cache with TTL expiry, thread safety, type hints and pytest tests. Output only code." "Write a TypeScript Express server with JWT auth, rate limiting, and tests with supertest. Output only code." "Write a Rust CLI that tails a log file and aggregates error counts per minute, with unit tests. Output only code." "Write a Go HTTP service exposing Prometheus metrics for a job queue, with table-driven tests. Output only code.")
 for np in ${NPLIST:-1 2 4}; do
   ctx=$((49152 / np)); [ $np -eq 1 ] && ctx=49152

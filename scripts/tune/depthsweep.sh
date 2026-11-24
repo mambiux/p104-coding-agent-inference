@@ -1,6 +1,6 @@
 #!/bin/bash
 # decode speed vs context depth (q4_0 KV, merged build, with and without the MTP head), after the fill test
-B=/home/mbx/CORE/llama/prism-pascal-best/bin; D=/home/mbx/models-local; T=/home/mbx/longshot/tune
+B=/home/<user>/CORE/llama/prism-pascal-best/bin; D=/home/<user>/models-local; T=/home/<user>/longshot/tune
 UUID=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader | grep P104 | awk -F', ' '{print $2}'); export CUDA_VISIBLE_DEVICES=$UUID LD_LIBRARY_PATH=$B
 while ! grep -q "FILL TEST DONE" $T/filltest.log; do sleep 15; done
 pkill -f "llama-server.*--port 809[7]" 2>/dev/null; sleep 2

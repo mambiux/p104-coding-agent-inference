@@ -1,5 +1,5 @@
 #!/bin/bash
-Q=/home/mbx/longshot/tune/queue; L=$Q/health.log
+Q=/home/<user>/longshot/tune/queue; L=$Q/health.log
 while true; do
   cur=$(cat $Q/current.pid 2>/dev/null); run=$(ls $Q/running 2>/dev/null | sed 's/^[0-9]*-//'); pend=$(ls $Q/pending | wc -l)
   util=$(nvidia-smi -i 0 --query-gpu=utilization.gpu --format=csv,noheader,nounits); mem=$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)

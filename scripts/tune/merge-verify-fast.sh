@@ -1,6 +1,6 @@
 #!/bin/bash
 # merge-verify.sh <candidate-bin-dir> [label]  — one gpuq job: proofs + benches for a merged build vs prism-pascal-best. ~18 min.
-C=$1; L=${2:-cand}; R=/home/mbx/CORE/llama/prism-pascal-best/bin; T=/home/mbx/longshot/tune; D=/home/mbx/models-local
+C=$1; L=${2:-cand}; R=/home/<user>/CORE/llama/prism-pascal-best/bin; T=/home/<user>/longshot/tune; D=/home/<user>/models-local
 M=$D/model-eng-dl/model-eng-Bonsai2-27B-Condensed-mtp-v2-thinkclose.gguf; [ -s $M ] || M=$D/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf
 echo "== $L: $C vs ref $R | model $(basename $M)"
 echo "== op tests"; LD_LIBRARY_PATH=$C $C/test-backend-ops test -o MUL_MAT -b CUDA0 -p type_a=ptq1_0 2>&1 | grep -E "tests passed|FAIL" | tail -2; LD_LIBRARY_PATH=$C $C/test-backend-ops test -o FLASH_ATTN_EXT -b CUDA0 2>&1 | grep -E "tests passed|FAIL" | tail -1

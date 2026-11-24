@@ -2,5 +2,5 @@
 # Cap the P104-100 at 128 W (fleet default chosen 2026-11-24: ~93 % decode / ~90 % prefill speed for ~70 % power). Undo: nvidia-smi -i GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81 -pl 180
 nvidia-smi -i GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81 -pm 1 >/dev/null 2>&1
 nvidia-smi -i GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81 -pl 128
-# Memory clock offset +100 (nominal; ≈ +49 MHz effective, 5005 → 5054 MHz). Chosen by Armando 2026-11-24 after a gated ladder (+0..+200 all clean: 0 bit errors, KLD 0). Undo: python3 -I /usr/local/sbin/p104-memoc-set.py 0
+# Memory clock offset +100 (nominal; ≈ +49 MHz effective, 5005 → 5054 MHz). Chosen by the operator 2026-11-24 after a gated ladder (+0..+200 all clean: 0 bit errors, KLD 0). Undo: python3 -I /usr/local/sbin/p104-memoc-set.py 0
 python3 -I /usr/local/sbin/p104-memoc-set.py 100 >/dev/null 2>&1

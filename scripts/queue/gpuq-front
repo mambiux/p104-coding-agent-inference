@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # gpuq-front <name-substring>...  — move matching pending jobs to the front of the queue, in the order given (others keep their order)
 import os,sys,time
-Q='/home/mbx/longshot/tune/queue/pending'; files=sorted(os.listdir(Q)); picked=[]
+Q='/home/<user>/longshot/tune/queue/pending'; files=sorted(os.listdir(Q)); picked=[]
 for pat in sys.argv[1:]:
     for f in files:
         if pat in f.split('-',1)[1] and f not in picked: picked.append(f)

@@ -1,6 +1,6 @@
 # prism-pascal-best — PrismML llama.cpp fork (branch prism, base d12ca13bb) tuned for P104-100 / sm_61
 
-Built from /home/mbx/CORE/llama/prism-pascal-arch (kernel architect tree) with the I=128 PTQ1_0 MMQ tile rows taken from optB.
+Built from /home/<user>/CORE/llama/prism-pascal-arch (kernel architect tree) with the I=128 PTQ1_0 MMQ tile rows taken from optB.
 `best.patch` = full diff against d12ca13bb (ggml/ only). `src/` = patched source, `bin/` = binaries + shared libs.
 
 ## Build (exact)
@@ -11,8 +11,8 @@ Built from /home/mbx/CORE/llama/prism-pascal-arch (kernel architect tree) with t
 (-j 4: gcc 13 segfaulted/ICE'd at -j 8/14 on this host.)
 
 ## Run
-The binaries carry RUNPATH=/home/mbx/CORE/llama/prism-pascal-arch/build/bin; to use the copies here set
-`LD_LIBRARY_PATH=/home/mbx/CORE/llama/prism-pascal-best/bin`.
+The binaries carry RUNPATH=/home/<user>/CORE/llama/prism-pascal-arch/build/bin; to use the copies here set
+`LD_LIBRARY_PATH=/home/<user>/CORE/llama/prism-pascal-best/bin`.
 
 ## What changed (all gated to cc 6.1; other archs untouched)
 1. `ggml/src/ggml-cuda/mmvq-ptq1_0-p61.cuh` (new) + hook in `mmvq.cu`: one-column PTQ1_0 mat-vec for sm_61.
@@ -30,7 +30,7 @@ The binaries carry RUNPATH=/home/mbx/CORE/llama/prism-pascal-arch/build/bin; to 
 - `GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH=0` -> PTQ1_0 prefill back to dequantize + cuBLAS (reference path)
 With GGML_CUDA_PTQ1_P61=0 and GGML_CUDA_PTQ1_0_MMQ_MAX_BATCH=0 the generated text was byte-identical to the reference (graphs on/off and the FWHT fusion do not change the text).
 
-## Measured (P104-100, llama-bench -ngl 99 -fa 1 -r 3, interleaved with the reference build /home/mbx/CORE/llama/prism-pascal/bin)
+## Measured (P104-100, llama-bench -ngl 99 -fa 1 -r 3, interleaved with the reference build /home/<user>/CORE/llama/prism-pascal/bin)
 | model / test          | reference | best   |
 |-----------------------|-----------|--------|
 | PTQ1_0 pp512          | 92.6      | 183.1  |

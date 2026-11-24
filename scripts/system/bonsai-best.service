@@ -5,13 +5,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=mbx
-Environment=B=/home/mbx/CORE/llama/prism-pascal-best8/bin
+User=<user>
+Environment=B=/home/<user>/CORE/llama/prism-pascal-best8/bin
 Environment=CTX=49152
 Environment=KVK=q4_0
 Environment=UB=256
 Environment=LLAMA_SPEC_CKPT_DEVICE_PLANE=1
-ExecStart=/home/mbx/longshot/bonsai-serve-best2.sh
+ExecStart=/home/<user>/longshot/bonsai-serve-best2.sh
 Restart=on-failure
 RestartSec=10
 

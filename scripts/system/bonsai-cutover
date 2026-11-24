@@ -1,6 +1,6 @@
 #!/bin/bash
 # bonsai-cutover <bin-dir>  — pause the GPU job queue and start the Bonsai serving unit on the given build. Reversible: bonsai-queue-resume.
-B=${1:-/home/mbx/CORE/llama/prism-pascal-best4/bin}; Q=/home/mbx/longshot/tune/queue
+B=${1:-/home/<user>/CORE/llama/prism-pascal-best4/bin}; Q=/home/<user>/longshot/tune/queue
 pkill -f gpuq-watchdo[g]; pkill -f gpuq-timeou[t]; pkill -f gpuq-healt[h]; pkill -f gpuq-runne[r]; sleep 1
 cur=$(cat $Q/current.pid 2>/dev/null); [ -n "$cur" ] && pkill -P $cur 2>/dev/null; for p in $(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader); do kill $p 2>/dev/null; done; sleep 4; for p in $(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader); do kill -9 $p 2>/dev/null; done; sleep 2
 j=$(ls $Q/running/*.job 2>/dev/null | head -1); [ -n "$j" ] && mv $j $Q/pending/ && echo "requeued interrupted job $(basename $j)"

@@ -1,4 +1,4 @@
---- /home/mbx/CORE/llama/prism-pascal-best/src/tools/server/server-context.cpp	2026-11-23 21:10:53.210838584 +0100
+--- /home/<user>/CORE/llama/prism-pascal-best/src/tools/server/server-context.cpp	2026-11-23 21:10:53.210838584 +0100
 +++ src/tools/server/server-context.cpp	2026-11-24 05:49:31.363904232 +0100
 @@ -293,6 +293,9 @@
      common_speculative * spec;

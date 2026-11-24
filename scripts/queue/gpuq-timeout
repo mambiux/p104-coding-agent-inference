@@ -1,6 +1,6 @@
 #!/bin/bash
 # kill a gpuq job whose PROCESS has run longer than 20 minutes (measured from process start, not from the job file's mtime)
-Q=/home/mbx/longshot/tune/queue
+Q=/home/<user>/longshot/tune/queue
 while true; do
   cur=$(cat $Q/current.pid 2>/dev/null)
   if [ -n "$cur" ] && kill -0 $cur 2>/dev/null; then

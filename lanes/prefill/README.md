@@ -1,6 +1,6 @@
 # prism-pascal-prefill — ternary tile kernel for PTQ1_0 prefill on sm_61 (P104-100)
 
-Base: /home/mbx/CORE/llama/prism-pascal-best/src. Diff: prefill.patch (mmq.cu hook, new mmq-ptq1-p61.cuh, test cases).
+Base: /home/<user>/CORE/llama/prism-pascal-best/src. Diff: prefill.patch (mmq.cu hook, new mmq-ptq1-p61.cuh, test cases).
 Build: same cmake line as prism-pascal-best (arch 61). Binaries: src/build/bin (RUNPATH to src/build/bin).
 Standalone microbench (kernel vs naive reference, variants): bench/ (bench.cu + ptq1-mmq-p61.cuh with experiment macros).
 

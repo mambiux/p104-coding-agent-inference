@@ -1,6 +1,6 @@
 #!/bin/bash
 # kills any process using the P104 that is not part of the current gpuq job
-Q=/home/mbx/longshot/tune/queue
+Q=/home/<user>/longshot/tune/queue
 while true; do
   cur=$(cat $Q/current.pid 2>/dev/null)
   allowed=""; [ -n "$cur" ] && allowed=$(python3 - "$cur" <<'PY'

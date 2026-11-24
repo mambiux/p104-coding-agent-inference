@@ -1,7 +1,7 @@
 #!/bin/bash
 # Conservative memory-offset ladder for the P104: +50..+200 MHz, hard gates, always rolls back. Serving is stopped for the run and restarted after.
-N=/home/mbx/CORE/llama/prism-pascal-novel; B=/home/mbx/CORE/llama/prism-pascal-best8/bin; T=/home/mbx/longshot/tune
-M=/home/mbx/models-local/model-eng-dl/model-eng-Bonsai2-27B-Condensed-mtp-v2-thinkclose.gguf
+N=/home/<user>/CORE/llama/prism-pascal-novel; B=/home/<user>/CORE/llama/prism-pascal-best8/bin; T=/home/<user>/longshot/tune
+M=/home/<user>/models-local/model-eng-dl/model-eng-Bonsai2-27B-Condensed-mtp-v2-thinkclose.gguf
 set -o pipefail
 export CUDA_VISIBLE_DEVICES=GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81   # the P104 — CUDA enumerates the 3060 first, nvidia-smi -i 0 is the P104
 ulimit -c 0

@@ -1,10 +1,10 @@
 #!/bin/bash
 # KV-cache quantization quality: KLD of q8_0 / q4_0 KV vs f16 KV on a code corpus, ctx 8192, merged build. Then a fill-to-max stability run.
-B=/home/mbx/CORE/llama/prism-pascal-best/bin; M=/home/mbx/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/mbx/longshot/tune
+B=/home/<user>/CORE/llama/prism-pascal-best/bin; M=/home/<user>/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/<user>/longshot/tune
 UUID=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader | grep P104 | awk -F', ' '{print $2}'); export CUDA_VISIBLE_DEVICES=$UUID LD_LIBRARY_PATH=$B
 while ! grep -q "CTX TESTS DONE" $T/ctxtest.log; do sleep 15; done
 # corpus: real code + prose from the fork tree (~400 KB)
-find /home/mbx/CORE/llama/prism-pascal-best/src/src /home/mbx/CORE/llama/prism-pascal-best/src/tools/server -name "*.cpp" -size +20k | head -12 | xargs cat > $T/corpus.txt; cat /home/mbx/CORE/llama/prism-pascal-best/src/README.md >> $T/corpus.txt; echo "corpus: $(wc -c < $T/corpus.txt) bytes"
+find /home/<user>/CORE/llama/prism-pascal-best/src/src /home/<user>/CORE/llama/prism-pascal-best/src/tools/server -name "*.cpp" -size +20k | head -12 | xargs cat > $T/corpus.txt; cat /home/<user>/CORE/llama/prism-pascal-best/src/README.md >> $T/corpus.txt; echo "corpus: $(wc -c < $T/corpus.txt) bytes"
 echo "== base f16 KV"; $B/llama-perplexity -m $M -ngl 999 -fa on -c 8192 -b 512 --chunks 6 -f $T/corpus.txt --kl-divergence-base $T/kld_f16.bin 2>&1 | grep -E "Final estimate|estimate: PPL" | tail -1
 for kv in q8_0 q4_0; do echo "== $kv KV vs f16"; $B/llama-perplexity -m $M -ngl 999 -fa on -c 8192 -b 512 --chunks 6 -f $T/corpus.txt -ctk $kv -ctv $kv --kl-divergence-base $T/kld_f16.bin --kl-divergence 2>&1 | grep -E "Mean +KLD|Maximum KLD|99.9%|Same top p|Mean +Δp|Mean PPL\(Q\)|PPL ratio|Final estimate" | head -8; done
 # fill test: largest config that loaded in the sweep

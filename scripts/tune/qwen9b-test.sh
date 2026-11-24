@@ -1,7 +1,7 @@
 #!/bin/bash
 # Qwen3.5-9B Q5_K_M on the P104 with upstream llama.cpp (P104 build): fit ladder, benches at depth, serving smoke. Pauses Bonsai serving, restores it at the end.
 export CUDA_VISIBLE_DEVICES=GPU-a2c2ef95-84b5-62ac-44b6-d862cdaf9b81; ulimit -c 0
-B=/home/mbx/CORE/llama/upstream-p61/bin; M=/mnt/ssd500/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf; T=/home/mbx/longshot/tune
+B=/home/<user>/CORE/llama/upstream-p61/bin; M=/mnt/ssd500/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf; T=/home/<user>/longshot/tune
 trap 'pkill -f "llama-server.*--port 8098" 2>/dev/null; sudo -n systemctl start bonsai-best; echo "[$(date +%T)] Bonsai serving restored"' EXIT
 sudo -n systemctl stop bonsai-best; for i in $(seq 1 90); do [ -z "$(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader)" ] && break; sleep 1; done; echo "card free: $(nvidia-smi -i 0 --query-gpu=memory.free --format=csv,noheader)"
 echo "== model: $(LD_LIBRARY_PATH=$B $B/llama-bench -m $M -ngl 99 -p 0 -n 0 -r 1 -o md 2>&1 | grep -oE 'qwen[^|]*' | head -1)"

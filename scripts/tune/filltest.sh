@@ -1,6 +1,6 @@
 #!/bin/bash
 # fill-to-max stability: ctx 65536 q4_0 KV, prompt trimmed by /tokenize to ~60k tokens, generate 300. Runs after the power sweep.
-B=/home/mbx/CORE/llama/prism-pascal-best/bin; M=/home/mbx/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/mbx/longshot/tune
+B=/home/<user>/CORE/llama/prism-pascal-best/bin; M=/home/<user>/models-local/Bonsai2-27B-PTQ1_0-Condensed-P2TG-mtp-v2.gguf; T=/home/<user>/longshot/tune
 UUID=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader | grep P104 | awk -F', ' '{print $2}')
 while ! grep -q "POWER SWEEP DONE" $T/powersweep.log; do sleep 15; done
 pkill -f "llama-server.*--port 8097" 2>/dev/null; sleep 1
