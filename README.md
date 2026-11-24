@@ -203,3 +203,9 @@ its ternary formats; on the Bonsai 2 27B model from [PrismML](https://huggingfac
 served file is a community condensed and edited variant, see the model lane notes); on
 [llama.cpp](https://github.com/ggml-org/llama.cpp) itself; and on NVIDIA's GP104, a chip that holds
 more than they led us to believe. Our only contribution was to go looking.
+
+## License
+
+PolyForm Noncommercial 1.0.0: free for noncommercial use with credit to the author; commercial
+use requires a paid license, see `COMMERCIAL.md`. Third-party components (llama.cpp, the PrismML
+fork, the Bonsai model) keep their own licenses.
