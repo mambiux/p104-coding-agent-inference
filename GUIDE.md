@@ -101,3 +101,41 @@ fits 64k with room to spare).
   makes prompt loading slow but does not change generation speed.
 
 Everything the script does is plain shell; read it before you run it, it is short.
+
+## Many cards in one box (the fleet)
+
+A mining-style chassis with 8–10 P104-100s (for example a Gigabyte G431-MM0: EPYC Embedded 3151,
+four 2.5" SATA bays with no RAID controller, 8–10 PCIe x16 slots at Gen3 x1, three 1600 W PSUs) runs
+one server per card. Gen3 x1 per card is enough: inference traffic over the link is tiny, model
+loading takes a few seconds longer.
+
+Before the OS: in the BIOS enable **Above 4G Decoding** (ten GPUs need the large BAR space; without
+it some cards are missing or the board does not POST), leave SATA in AHCI, and update the BIOS and
+BMC firmware while the vendor still hosts them. Give the chassis fans a real curve; the cards are
+passive.
+
+Sizing: 10 cards at the 128 W cap draw about 1.3 kW plus the host, which three 1600 W supplies carry
+with redundancy. RAM: the model file is mapped once and shared, then about 1 GB per server; 16 GB is
+tight for ten cards, 32 GB is comfortable. CPU: a 4-core embedded EPYC feeds ten servers at one
+thread each (the work is on the GPUs), but do not build on it; build on another machine and copy
+`~/bonsai` over, or let `install.sh` build overnight.
+
+Then:
+
+```
+bash install.sh                 # once: toolchain, build, model, one server on card 0 (stop it after)
+sudo systemctl stop bonsai      # if you installed the single-card unit
+MEM_OFFSET=100 bash fleet/fleet-install.sh
+```
+
+`fleet-install.sh` finds every P104-100 with 8 GB, writes one environment file per card, installs
+a template unit (`bonsai@N`), caps power and sets the memory offset on every card at boot, and puts
+an nginx least-connections router on port 8080 in front of all of them. Agents talk to the router as
+one OpenAI-compatible endpoint; ten agents run in parallel, each on its own card at full speed.
+`~/bonsai/fleet/status.sh` shows temperatures, power, clocks and health per card; `journalctl -u
+bonsai@3` shows card 3's log. Options: `CTX`, `SPEC`, `POWER_W`, `MEM_OFFSET`, `BASE_PORT`,
+`ROUTER_PORT`, `THREADS`, `MODEL`.
+
+What a fleet does not do: it does not make one request faster than one card. Splitting a larger
+model across cards over x1 links works in llama.cpp (layer split) but runs at roughly one card's
+bandwidth for the whole model; measure before planning around it.

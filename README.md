@@ -266,6 +266,7 @@ lanes/     per-lane patches and notes (fa, prefill, arch2, arch3, rs, fusion, mt
 scripts/   serve/ (launchers), system/ (units, power cap, memory offset, cut-over), queue/ (gpuq),
            tune/ (verification battery, sweeps, ladders)
 GUIDE.md   what you need and what install.sh does; install.sh sets a fresh Ubuntu box up end to end
+fleet/     fleet-install.sh: one server per card, template unit, power and offset on every card, nginx router
 harness/   headless-browser tests for generated pages and games, fix loop, grader
 ```
 
